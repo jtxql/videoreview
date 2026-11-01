@@ -13,31 +13,110 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /** Coordinator owns lifecycle/control; separate IN readers finish before cleanup. */
-class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
+class TourBoxUsbManager(context: Context, private val log: (String) -> Unit, private val captureHealthy: () -> Boolean = { false }) {
     private companion object {
-        // At most one quarantined session per process. Retain native request/buffer
-        // until process exit; a recreated Activity must not silently bypass it.
-        @Volatile var quarantined: Pair<UsbDeviceConnection, DualEndpointSession>? = null
+        val leases = ExclusiveUsbLease<UsbConnectionResources>()
+        val generations = UsbGenerationTracker<UsbDeviceConnection>()
+        val managerIds = AtomicLong()
+        val quarantined: UsbConnectionResources? get() = leases.retained
     }
-    val system: UsbManager = context.getSystemService(UsbManager::class.java)
+    val system: UsbManager = context.applicationContext.getSystemService(UsbManager::class.java)
+    private val managerId = managerIds.incrementAndGet()
+    // Strict is the approved fallback; policy is not a physical-generation assertion.
+    private val detachPolicy = DetachPolicy.Strict
+    @Volatile private var identity: UsbOpenGeneration<UsbDeviceConnection>? = null
+    private val detachObservation = AtomicReference<DetachObservation<UsbDeviceConnection>?>(null)
+    fun observing(active: Boolean) = generations.observing(managerId, active)
+    fun attached(device: UsbDevice) { generations.attached(device.deviceName) }
+    private fun owns(key: UsbOpenGeneration<UsbDeviceConnection>?, opened: UsbDeviceConnection?): Boolean =
+        key != null && opened != null && identity === key && key.connection === opened && leases.owns(key.token)
+    private var leaseToken: Long? = null
+    private var resourceRecord: UsbConnectionResources? = null
+    private var asyncResources: UsbRequestResources? = null
+    @Volatile private var cleanupLabel = "未连接"
+    var cleanupStatus: String
+        get() = if (identity?.logicallyDisconnected == true && cleanupLabel == "已连接") "已逻辑断开；等待回收结果" else cleanupLabel
+        private set(value) { cleanupLabel = value }
+    private fun acquireConnection(device: UsbDevice): UsbDeviceConnection? {
+        val token = leases.acquire() ?: error("进程中已有连接/隔离所有者，拒绝新 openDevice")
+        leaseToken = token
+        var opened: UsbDeviceConnection? = null
+        try {
+            opened = system.openDevice(device)
+            if (opened == null) { leases.release(token); leaseToken = null; return null }
+            val key = generations.opened(token, managerId, opened, device.deviceName, device.deviceId, SystemClock.elapsedRealtimeNanos())
+            identity = key
+            detachObservation.set(null)
+            cleanupStatus = "已连接"
+            log("[open generation] token=$token origin=${key.origin}；应用代次，不是物理插拔代次")
+            return opened
+        } catch (e: Exception) {
+            // If open succeeded but bookkeeping failed, retain this unqueued resource
+            // through the ordinary coordinator cleanup instead of releasing ownership.
+            if (opened != null) {
+                connection = opened
+                if (identity == null) {
+                    val retained = UsbConnectionResources(token, device.deviceName, device.deviceId, opened, emptyList(), null)
+                    resourceRecord = retained
+                    leases.retain(token, retained)
+                    cleanupStatus = "已逻辑断开；open记录建立异常（隔离）"
+                }
+            }
+            else { leases.release(token); leaseToken = null }
+            throw e
+        }
+    }
+    private fun observeMissing(key: UsbOpenGeneration<UsbDeviceConnection>, name: String, id: Int,
+        source: ObservationSource, presence: DevicePresence) {
+        val snapshot = generations.capture(key, epoch.get(), name, id, source,
+            SystemClock.elapsedRealtimeNanos(), presence, asyncResources?.lifecycle?.state)
+        val decision = generations.association(snapshot, key.token.takeIf { leases.owns(it) }, key.connection, detachPolicy)
+        log("[detach observation] token=${key.token} observation=${snapshot.number} receivedNanos=${snapshot.receivedNanos} openedNanos=${key.openedNanos} epoch=${snapshot.managerEpoch} source=$source phase=${snapshot.phase} request=${snapshot.requestState} presence=$presence classification=${decision.association} reason=${decision.reason}")
+        if (decision.association == DetachAssociation.Unrelated) return
+        // Every observation is immutable. Do not overwrite an earlier snapshot;
+        // contradictions are latched on the generation by the process ledger.
+        if (source == ObservationSource.DetachBroadcast) detachObservation.compareAndSet(null, snapshot)
+        if (!generations.disconnect(snapshot, key.token.takeIf { leases.owns(it) }, key.connection)) return
+        if (!disposed) worker.execute {
+            if (owns(key, key.connection)) {
+                advanceEpoch(); stopRequested = true
+                closeInternal("原连接缺失观察 token=${key.token}")
+            }
+        }
+    }
+    fun detached(device: UsbDevice) {
+        val key = identity ?: return
+        val presence = try {
+            if (system.deviceList.containsKey(key.name)) DevicePresence.Present else DevicePresence.Absent
+        } catch (_: Exception) { DevicePresence.QueryFailed }
+        observeMissing(key, device.deviceName, device.deviceId, ObservationSource.DetachBroadcast, presence)
+    }
     private var connection: UsbDeviceConnection? = null
     private var claimed: UsbInterface? = null
     private var claimedIndex: Int? = null
     private var connectedDevice: UsbDevice? = null
     private val worker = Executors.newSingleThreadExecutor()
     private val epoch = AtomicLong()
+    private val input = io.tabletennisreview.input.TourBoxInputPipeline(log) { session -> epoch.get() == session && identity?.logicallyDisconnected != true }
+    val inputEvents: io.tabletennisreview.input.TourBoxInputEvents get() = input.events
+    private fun advanceEpoch(): Long {
+        val next = epoch.incrementAndGet()
+        input.end()
+        return next
+    }
     private val readerActive = AtomicBoolean()
     @Volatile private var stopRequested = false
     @Volatile private var disposed = false
-    @Volatile var canListen = false
-        private set
+    @Volatile private var listenAvailable = false
+    var canListen: Boolean
+        get() = listenAvailable && identity?.logicallyDisconnected != true
+        private set(value) { listenAvailable = value }
     val isListening: Boolean get() = readerActive.get()
     val totalBytes = AtomicLong()
     val readCount = AtomicLong()
     val controlStats = EndpointStats()
     val dataStats = EndpointStats()
     private val dualClaims = mutableListOf<UsbInterface>()
-    private var unsafeSession: DualEndpointSession? = null
     @Volatile private var cdcReady = false
     private val cdcBusy = AtomicBoolean()
     private val pendingCdc = AtomicReference<Pair<Long, CdcAction>?>(null)
@@ -47,7 +126,7 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
     private val config94 = Config94Experiment()
     private data class ConfigRequest(val epoch: Long, val healthy: () -> Boolean)
     private val pendingConfig = AtomicReference<ConfigRequest?>(null)
-    val canConfig94: Boolean get() = cdcReady && !cdcBusy.get() && !stopRequested && !disposed && quarantined == null && config94.ready(epoch.get())
+    val canConfig94: Boolean get() = cdcReady && !cdcBusy.get() && !stopRequested && !disposed && identity?.logicallyDisconnected != true && quarantined == null && config94.ready(epoch.get())
     fun configToken(): Long? = if (canConfig94) epoch.get() else null
     fun configEvidence() = config94.summary()
     fun queueConfig94(token: Long, confirmed: Boolean, healthy: () -> Boolean) {
@@ -61,6 +140,7 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
         try {
             val device = connectedDevice
             val opened = connection
+            check(owns(identity, opened) && session.ownsConnection(opened)) { "控制操作的token/原连接所有权失效" }
             check(command.epoch == sessionEpoch && epoch.get() == sessionEpoch && !stopRequested && !disposed && cdcReady && session.acceptingControls && quarantined == null && config94.validReserved(sessionEpoch)) { "会话或回复证据失效" }
             check(device != null && opened != null && device.vendorId == 0xCAFE && device.productId == 0x4001 && system.deviceList[device.deviceName]?.deviceId == device.deviceId && system.hasPermission(device)) { "设备/权限失效" }
             check(dualClaims.size == 2 && dualClaims[0].id == 0 && dualClaims[1].id == 1) { "双接口未占用" }
@@ -81,10 +161,10 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
             log("[配置94] 保持原始IN观察，本连接不再发送任何初始化。")
         } catch (e: Exception) {
             log("[配置94 FAILED] ${e.javaClass.simpleName}: ${e.message}；停止，不重试或恢复")
-            stopRequested = true; cdcReady = false; epoch.incrementAndGet()
+            stopRequested = true; cdcReady = false; advanceEpoch()
         } finally { cdcBusy.set(false) }
     }
-    val canCdc: Boolean get() = cdcReady && !cdcBusy.get() && !candidate.used() && !stopRequested && !disposed && quarantined == null
+    val canCdc: Boolean get() = cdcReady && !cdcBusy.get() && !candidate.used() && !stopRequested && !disposed && identity?.logicallyDisconnected != true && quarantined == null
     val canUnlock: Boolean get() = canCdc && candidate.ready()
     fun unlockToken(): Long? = if (canUnlock) epoch.get() else null
     fun cdcEvidence() = candidate.summary()
@@ -104,6 +184,7 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
         try {
             val device = connectedDevice
             val opened = connection
+            check(owns(identity, opened) && session.ownsConnection(opened)) { "控制操作的token/原连接所有权失效" }
             check(command.epoch == sessionEpoch && epoch.get() == sessionEpoch && !stopRequested && !disposed && cdcReady && session.acceptingControls && quarantined == null) { "会话/监听已失效" }
             check(device != null && opened != null && device.vendorId == 0xCAFE && device.productId == 0x4001 && system.deviceList[device.deviceName]?.deviceId == device.deviceId && system.hasPermission(device)) { "设备/权限/连接已失效" }
             check(dualClaims.size == 2 && dualClaims[0].id == 0 && dualClaims[1].id == 1) { "双接口未占用" }
@@ -117,6 +198,7 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
             check(epoch.get() == sessionEpoch && !stopRequested && session.acceptingControls && system.hasPermission(device) && command.captureHealthy()) { "发送前状态或实验日志变化" }
             val before = SystemClock.elapsedRealtime()
             val bytes = UnlockCandidate.payload()
+            input.expectReply(sessionEpoch, SystemClock.elapsedRealtimeNanos())
             config94.begin(sessionEpoch, SystemClock.elapsedRealtime())
             val result = opened.bulkTransfer(endpoint, bytes, bytes.size, 1000)
             config94.sent(result)
@@ -129,7 +211,7 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
             log("[候选 TX FAILED] ${e.javaClass.simpleName}: ${e.message}；停止实验，不重试、不补发、不恢复。")
             cdcReady = false
             stopRequested = true
-            epoch.incrementAndGet()
+            advanceEpoch()
         } finally { cdcBusy.set(false) }
     }
 
@@ -148,6 +230,7 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
         try {
             val device = connectedDevice
             val opened = connection
+            check(owns(identity, opened) && session.ownsConnection(opened)) { "控制操作的token/原连接所有权失效" }
             check(command.first == sessionEpoch && epoch.get() == sessionEpoch && !stopRequested && !disposed && session.acceptingControls && cdcReady && quarantined == null) { "会话已停止或失效" }
             check(device != null && device.vendorId == 0xCAFE && device.productId == 0x4001 && system.deviceList[device.deviceName]?.deviceId == device.deviceId && system.hasPermission(device) && opened != null) { "设备/权限/连接失效" }
             check(dualClaims.size == 2 && dualClaims[0].id == 0 && dualClaims[0].interfaceClass == 2 && dualClaims[0].interfaceSubclass == 2 && dualClaims[1].id == 1 && dualClaims[1].interfaceClass == 10) { "双接口占用状态不正确" }
@@ -166,22 +249,37 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
             log("[CDC ${action.name} FAILED] ${e.javaClass.simpleName}: ${e.message}；停止本轮，不自动重试或恢复。")
             cdcReady = false
             stopRequested = true
-            epoch.incrementAndGet()
+            advanceEpoch()
             pendingCdc.set(null)
         } finally {
             cdcBusy.set(false)
         }
     }
     fun endpointSummary() = controlStats.summary("0x81") + "\n" + dataStats.summary("0x82")
-    @Volatile
-    var connectedName: String? = null
-        private set
+    @Volatile private var connectionName: String? = null
+    var connectedName: String?
+        get() = if (identity?.logicallyDisconnected == true) null else connectionName
+        private set(value) { connectionName = value }
 
-    fun devices(): List<UsbDevice> = system.deviceList.values.sortedBy { it.deviceName }
+    fun devices(): List<UsbDevice> {
+        val key = identity // Capture BEFORE querying, never close a newer generation.
+        val devices = try { system.deviceList.values.sortedBy { it.deviceName } }
+        catch (e: Exception) {
+            if (key != null) observeMissing(key, key.name, key.id, ObservationSource.Enumeration, DevicePresence.QueryFailed)
+            throw e
+        }
+        if (key != null) {
+            val present = devices.any { it.deviceName == key.name }
+            if (!present || key.logicallyDisconnected)
+                observeMissing(key, key.name, key.id, ObservationSource.Enumeration, if (present) DevicePresence.Present else DevicePresence.Absent)
+        }
+        return devices
+    }
 
     fun connect(device: UsbDevice, interfaceIndex: Int?, force: Boolean = false) {
         if (disposed) return
-        val request = epoch.incrementAndGet()
+        identity?.let { generations.stopping(it, true) }
+        val request = advanceEpoch()
         stopRequested = true
         cdcReady = false
         canListen = false
@@ -213,7 +311,7 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
                 log("连接失败：接口索引无效，请刷新。")
                 return
             }
-            val opened = system.openDevice(current)
+            val opened = acquireConnection(current)
             if (opened == null) {
                 log("openDevice 返回 null：设备可能已断开，或系统无法开放访问。")
                 return
@@ -248,10 +346,13 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
 
     fun close(reason: String) {
         if (disposed) return
-        epoch.incrementAndGet()
+        identity?.let { generations.stopping(it, true) }
+        advanceEpoch()
         stopRequested = true
         cdcReady = false
         canListen = false
+        connectedName = null
+        cleanupStatus = "已逻辑断开；等待回收结果"
         worker.execute { closeInternal(reason) }
     }
 
@@ -260,6 +361,7 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
         close("Activity 销毁")
         disposed = true
         // Already queued read/cleanup runs to completion; no shutdownNow/interrupt race.
+        worker.execute { input.close() }
         worker.shutdown()
     }
 
@@ -286,24 +388,29 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
             try {
                 val opened = connection
                 val endpoint = readEndpoint()
-                if (epoch.get() != request || stopRequested || opened == null || endpoint == null) {
+                val generation = identity
+                if (!owns(generation, opened) || epoch.get() != request || stopRequested || opened == null || endpoint == null) {
                     log("监听取消：连接或权限状态已变化。")
                     return@execute
                 }
+                input.begin(request)
                 log("手动开始 BULK IN：interface=1 endpoint=0x82 timeout=200ms；不解析事件。")
                 val buffer = ByteArray(64)
                 var negativeCount = 0L
                 var fastFailures = 0
-                while (!stopRequested && epoch.get() == request) {
+                while (!stopRequested && epoch.get() == request && owns(generation, opened) && generation?.logicallyDisconnected != true) {
                     val before = SystemClock.elapsedRealtime()
                     val size = opened.bulkTransfer(endpoint, buffer, buffer.size, 200)
                     val elapsed = SystemClock.elapsedRealtime() - before
                     if (size > 0) {
+                        val receivedNanos = SystemClock.elapsedRealtimeNanos()
+                        val receivedMillis = System.currentTimeMillis()
                         dataStats.reads.incrementAndGet()
                         dataStats.bytes.addAndGet(size.toLong())
                         totalBytes.addAndGet(size.toLong())
                         val count = readCount.incrementAndGet()
                         log("[0x82 BULK IN] RX #$count bytes=$size HEX=" + buffer.take(size).joinToString(" ") { "%02X".format(it.toInt() and 0xFF) })
+                        input.accept(request, buffer.copyOf(size), receivedNanos, receivedMillis)
                         fastFailures = 0
                     } else {
                         val device = connectedDevice
@@ -334,6 +441,7 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
                 log("读取异常：${e.javaClass.simpleName}: ${e.message}")
             } finally {
                 if (!canListen) closeInternal("读取结束后清理失效连接")
+                input.end()
                 readerActive.set(false)
                 log("读取任务已退出；累计 bytes=${totalBytes.get()} reads=${readCount.get()}。")
             }
@@ -341,7 +449,8 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
     }
 
     fun stopListening() {
-        epoch.incrementAndGet()
+        identity?.let { generations.stopping(it, true) }
+        advanceEpoch()
         stopRequested = true
         cdcReady = false
         if (readerActive.get()) log("已请求停止；等待当前有限超时读取返回，期间不关闭连接。")
@@ -350,7 +459,8 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
     fun startDualListening(device: UsbDevice, confirmedForce: Boolean) {
         if (disposed || !confirmedForce) return
         if (!readerActive.compareAndSet(false, true)) { log("请先停止现有读取任务，再启动双接口模式。"); return }
-        val request = epoch.incrementAndGet()
+        identity?.let { generations.stopping(it, true) }
+        val request = advanceEpoch()
         stopRequested = true
         canListen = false
         worker.execute {
@@ -370,7 +480,7 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
                 val ep81 = endpoint(control, 0x81, UsbConstants.USB_ENDPOINT_XFER_INT)
                 val ep82 = endpoint(data, 0x82, UsbConstants.USB_ENDPOINT_XFER_BULK)
                 require(ep81.maxPacketSize == 8 && ep82.maxPacketSize == 64) { "端点包长与已知描述符不符，停止实验" }
-                connection = system.openDevice(current) ?: error("openDevice=null")
+                connection = acquireConnection(current) ?: error("openDevice=null")
                 connectedDevice = current
                 connectedName = current.deviceName
                 val opened = connection!!
@@ -383,16 +493,31 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
                 }
                 if (epoch.get() != request) return@execute
                 stopRequested = false
+                input.begin(request)
+                val sessionKey = identity ?: error("连接身份丢失")
                 val session = DualEndpointSession(opened, ep81, ep82, controlStats, dataStats,
-                    { stopRequested || epoch.get() != request },
+                    { stopRequested || epoch.get() != request || sessionKey.logicallyDisconnected },
                     { system.deviceList[current.deviceName]?.deviceId == current.deviceId && system.hasPermission(current) },
+                    { when {
+                        system.deviceList[current.deviceName]?.deviceId != current.deviceId -> UsbStopReason.DeviceMissingUnconfirmed
+                        !system.hasPermission(current) -> UsbStopReason.PermissionChanged
+                        else -> UsbStopReason.IoException } },
                     { source, bytes, stats ->
+                        val receivedNanos = SystemClock.elapsedRealtimeNanos()
+                        val receivedMillis = System.currentTimeMillis()
                         if (source == "0x82 BULK IN" && config94.observe(request, bytes, SystemClock.elapsedRealtime()))
                             log("[配置94 回复证据] 完整26字节已按流匹配（可跨读取块），RX结束序号=${readCount.get() + 1}；原始块继续完整记录")
                         stats.reads.incrementAndGet(); stats.bytes.addAndGet(bytes.size.toLong())
                         readCount.incrementAndGet(); totalBytes.addAndGet(bytes.size.toLong())
                         log("[$source] RX bytes=${bytes.size} HEX=" + bytes.joinToString(" ") { "%02X".format(it.toInt() and 0xFF) })
-                    }, log)
+                        if (source.startsWith("0x82")) input.accept(request, bytes, receivedNanos, receivedMillis)
+                    }, log, failure@ {
+                        if (!owns(sessionKey, opened)) return@failure
+                        generations.ioFailed(sessionKey, opened, SystemClock.elapsedRealtimeNanos())
+                        stopRequested = true; cdcReady = false; canListen = false
+                        connectedName = null; cleanupStatus = "已逻辑断开；等待回收结果"
+                        advanceEpoch()
+                    })
                 session.onCoordinatorTick = {
                     runPendingCdc(request, session)
                     runPendingUnlock(request, session)
@@ -400,10 +525,10 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
                 }
                 cdcReady = true
                 log("[CDC] 双接口已占用，A1/A2/A3 可分别手动触发；不会自动初始化。")
-                if (!session.run()) {
-                    unsafeSession = session
-                    quarantined = opened to session
-                }
+                asyncResources = session.run()
+                // run returns only after both readers AND the last control action finish.
+                connectedName = null
+                cleanupStatus = "已逻辑断开；等待回收结果"
             } catch (e: Exception) {
                 log("双接口实验异常：${e.javaClass.simpleName}: ${e.message}")
             } finally {
@@ -415,6 +540,7 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
     }
 
     private fun closeInternal(reason: String) {
+        input.end()
         cdcReady = false
         candidate.reset()
         config94.reset()
@@ -423,30 +549,85 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
         if (pendingCdc.getAndSet(null) != null) log("[CDC] 取消尚未发送的手动请求：$reason")
         cdcBusy.set(false)
         canListen = false
-        if (unsafeSession != null) { log("隔离连接未关闭：仍不能确认 async 请求已回收。禁止继续访问。"); return }
-        val opened = connection ?: return
-        connection = null
         connectedName = null
-        connectedDevice = null
-        val intf = claimed
-        claimed = null
-        claimedIndex = null
-        for (dual in dualClaims.asReversed()) {
-            try { log("双接口 releaseInterface(id=${dual.id})=${opened.releaseInterface(dual)}") }
-            catch (e: Exception) { log("双接口释放 id=${dual.id} 异常：${e.message}") }
+        val key = identity
+        val opened = connection
+        if (resourceRecord == null && opened != null && key != null) {
+            resourceRecord = UsbConnectionResources(key.token, key.name, key.id, opened,
+                dualClaims.toList() + listOfNotNull(claimed), asyncResources)
         }
-        dualClaims.clear()
-        try {
-            if (intf != null) log("releaseInterface(id=${intf.id})=${opened.releaseInterface(intf)}")
-        } catch (e: Exception) {
-            log("释放接口异常：${e.javaClass.simpleName}: ${e.message}")
-        } finally {
-            try {
-                opened.close()
-                log("连接已关闭：$reason")
-            } catch (e: Exception) {
-                log("关闭连接异常：${e.javaClass.simpleName}: ${e.message}")
+        val record = resourceRecord
+        if (record == null) {
+            if (opened != null) {
+                val token = leaseToken
+                if (token != null && leases.owns(token)) {
+                    val retained = UsbConnectionResources(token, connectedDevice?.deviceName ?: "unregistered", connectedDevice?.deviceId ?: -1,
+                        opened, dualClaims.toList() + listOfNotNull(claimed), asyncResources)
+                    resourceRecord = retained
+                    leases.retain(token, retained)
+                }
+                cleanupStatus = "已逻辑断开；连接记录不完整（隔离）"
+                log(cleanupStatus)
+                return // Never release an unregistered native open.
             }
+            leaseToken?.let { leases.release(it) }
+            leaseToken = null; identity = null
+            cleanupStatus = if (quarantined == null) "已逻辑断开；无待回收资源" else "已逻辑断开；进程中有隔离资源"
+            return
+        }
+        if (!owns(key, record.connection) || key?.token != record.token) {
+            if (leases.owns(record.token)) leases.retain(record.token, record)
+            cleanupStatus = "已逻辑断开；清理所有权不匹配（隔离）"
+            log(cleanupStatus)
+            return // Refuse native work, including closing a possibly newer connection.
+        }
+        val async = record.async
+        // This coordinator only runs after session.run joined both readers and
+        // returned from the final control/OUT operation. No other wait consumer exists.
+        val snapshot = detachObservation.get()
+        val association = snapshot?.let { generations.association(it, record.token.takeIf { token -> leases.owns(token) }, record.connection, detachPolicy) }
+        if (async != null && async.lifecycle.canSupplement) {
+            val stillAbsent = try { !system.deviceList.containsKey(record.deviceName) } catch (_: Exception) { false }
+            val readiness = SupplementReadiness(
+                sameResources = async.connection === record.connection && owns(key, record.connection),
+                readersJoined = async.lifecycle.readerExited,
+                controlsFinished = true, // serialized worker, after session.run returns
+                exclusiveWaitOwner = async.lifecycle.coordinatorOwns,
+                requestUnconfirmed = async.lifecycle.canSupplement,
+                deviceAbsent = stillAbsent,
+                logHealthy = captureHealthy(),
+            )
+            val eligible = readiness.eligible(association ?: AssociationDecision(DetachAssociation.Unknown, "no bound detach snapshot"))
+            log("[supplement gate] token=${record.token} eligible=$eligible association=${association?.association ?: DetachAssociation.Unknown} reason=${association?.reason ?: "no bound detach snapshot"} readiness=$readiness")
+            if (eligible) {
+                log("[cleanup] token=${record.token} 应用层观察关联；一次有限交接，不证明物理代次，不再cancel/queue")
+                if (readiness.observe(checkNotNull(association), async.lifecycle, async, AndroidCleanupClock) { log("[0x81 handoff] $it") }) {
+                    val bytes = async.payload()
+                    if (bytes.isNotEmpty()) {
+                        controlStats.reads.incrementAndGet(); controlStats.bytes.addAndGet(bytes.size.toLong())
+                        readCount.incrementAndGet(); totalBytes.addAndGet(bytes.size.toLong())
+                        log("[0x81 INTERRUPT IN (交接完成)] RX bytes=${bytes.size} HEX=" + bytes.joinToString(" ") { "%02X".format(it.toInt() and 255) })
+                    }
+                }
+            }
+        }
+        val finished = record.finish { log("[cleanup token=${record.token}] $it") }
+        // Clear Manager's operational fields even when native resources must be retained.
+        connection = null; connectedDevice = null; claimed = null; claimedIndex = null
+        dualClaims.clear(); asyncResources = null
+        if (finished) {
+            val receipt = generations.closed(checkNotNull(key), record.connection, SystemClock.elapsedRealtimeNanos(), key.normalStopRequested)
+            log("[close receipt] token=${receipt.token} normal=${receipt.normal} request/connection close completed")
+            leases.release(record.token)
+            detachObservation.set(null)
+            resourceRecord = null; identity = null; leaseToken = null
+            cleanupStatus = "已逻辑断开；资源回收完成"
+            log("连接已关闭：$reason；$cleanupStatus")
+        } else {
+            generations.quarantine(checkNotNull(key))
+            leases.retain(record.token, record)
+            cleanupStatus = "已逻辑断开；回收状态未知（隔离）"
+            log("$cleanupStatus token=${record.token} state=${async?.lifecycle?.state} reason=${async?.lifecycle?.reason} lastWait=${async?.lifecycle?.lastWaitReason}；不强制释放，不允许新连接")
         }
     }
 }

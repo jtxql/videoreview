@@ -2,10 +2,7 @@ package io.tabletennisreview.usbdiagnostics
 
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
-import android.hardware.usb.UsbRequest
 import android.os.SystemClock
-import java.nio.ByteBuffer
-import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -27,25 +24,31 @@ class DualEndpointSession(
     private val dataStats: EndpointStats,
     private val cancelled: () -> Boolean,
     private val devicePresent: () -> Boolean,
+    private val unavailableReason: () -> UsbStopReason,
     private val received: (String, ByteArray, EndpointStats) -> Unit,
     private val log: (String) -> Unit,
+    private val logicalFailure: () -> Unit,
 ) {
     private val failed = AtomicBoolean()
-    private val safeToClose = AtomicBoolean(true)
+    @Volatile private var failureReason = UsbStopReason.UserStop
+    @Volatile var requestResources: UsbRequestResources? = null
+        private set
     private val bulkStarted = AtomicBoolean()
     private val interruptStarted = AtomicBoolean()
     // Runs only on the connection coordinator, never on an IN reader or UI thread.
     var onCoordinatorTick: () -> Unit = {}
+    fun ownsConnection(candidate: UsbDeviceConnection?): Boolean = connection === candidate
     val acceptingControls: Boolean get() = !stopping() && bulkStarted.get() && interruptStarted.get()
     private fun stopping() = failed.get() || cancelled()
     private fun fail(endpoint: String, stats: EndpointStats, message: String) {
         stats.errors.incrementAndGet()
+        failureReason = UsbStopReason.IoException
         log("[$endpoint] $message；停止双端点会话。")
-        failed.set(true)
+        if (failed.compareAndSet(false, true)) logicalFailure()
     }
 
     /** Called by connection coordinator; returns only after BOTH readers exit. */
-    fun run(): Boolean {
+    fun run(): UsbRequestResources? {
         val bulk = Thread({ readBulk() }, "TourBox-IN-82")
         val interrupt = Thread({ readInterrupt() }, "TourBox-IN-81")
         val started = mutableListOf<Thread>()
@@ -70,8 +73,9 @@ class DualEndpointSession(
                 }
             }
         }
-        log("双端点读取任务均已退出；async 安全回收=${safeToClose.get()}")
-        return safeToClose.get()
+        requestResources?.lifecycle?.takeOver(readersJoined = true, controlsFinished = true)
+        log("双端点读取任务均已退出；async state=${requestResources?.lifecycle?.state} reason=${requestResources?.lifecycle?.reason}; owner=coordinator")
+        return requestResources
     }
 
     private fun readBulk() {
@@ -106,81 +110,56 @@ class DualEndpointSession(
     }
 
     private fun readInterrupt() {
-        val request = UsbRequest()
-        val buffer = ByteBuffer.allocateDirect(8)
-        var pending = false
+        val resources = UsbRequestResources(connection)
+        requestResources = resources
+        val life = resources.lifecycle
+        val buffer = resources.buffer
+        fun emit(source: String) {
+            val bytes = resources.payload()
+            if (bytes.isNotEmpty()) received(source, bytes, controlStats)
+        }
         try {
-            if (!request.initialize(connection, interruptIn)) {
+            if (!resources.request.initialize(connection, interruptIn)) {
+                life.stopped(UsbStopReason.IoException)
                 fail("0x81", controlStats, "UsbRequest.initialize=false")
                 return
             }
             while (!stopping()) {
-                if (!pending) {
+                if (life.state != AsyncCleanupState.Pending) {
                     buffer.clear()
-                    if (!request.queue(buffer)) { fail("0x81", controlStats, "queue=false"); break }
-                    pending = true
+                    // Conservatively reserve Pending before entering native queue: an
+                    // exception must not permit freeing a possibly submitted request.
+                    life.queued()
+                    if (!resources.request.queue(buffer)) { life.queueRejected(); life.stopped(UsbStopReason.IoException); fail("0x81", controlStats, "queue=false"); break }
                     interruptStarted.set(true)
                 }
-                val completed = try {
-                    connection.requestWait(200)
-                } catch (_: TimeoutException) {
-                    controlStats.timeouts.incrementAndGet()
-                    if (!devicePresent()) { fail("0x81", controlStats, "等待超时且设备/权限失效"); break }
-                    continue // Keep the SAME request queued; never queue it twice.
-                }
-                if (completed !== request) {
-                    fail("0x81", controlStats, "requestWait 返回 null 或未知请求，停止并撤销")
-                    break
-                }
-                pending = false
-                val count = buffer.position()
-                if (count > 0) {
-                    buffer.flip()
-                    val bytes = ByteArray(count)
-                    buffer.get(bytes)
-                    received("0x81 INTERRUPT IN", bytes, controlStats)
-                } else {
-                    fail("0x81", controlStats, "异步完成无有效载荷，无法由 Java API 可靠判断传输状态")
-                    break
+                when (resources.waitFor(200)) {
+                    WaitResult.Timeout -> {
+                        controlStats.timeouts.incrementAndGet()
+                        if (!devicePresent()) { life.stopped(unavailableReason()); fail("0x81", controlStats, "等待超时；${life.reason}"); break }
+                    }
+                    WaitResult.Null -> { life.stopped(UsbStopReason.WaitNull); fail("0x81", controlStats, "requestWait=null (error, not timeout)"); break }
+                    WaitResult.OtherRequest -> { life.stopped(UsbStopReason.WaitOtherRequest); fail("0x81", controlStats, "requestWait=other request; original still unconfirmed"); break }
+                    WaitResult.Original -> {
+                        life.completed()
+                        if (buffer.position() > 0) emit("0x81 INTERRUPT IN")
+                        else { fail("0x81", controlStats, "原请求已取回，但无有效载荷；传输状态未知"); break }
+                    }
                 }
             }
         } catch (e: Exception) {
+            life.stopped(UsbStopReason.IoException)
             fail("0x81", controlStats, "${e.javaClass.simpleName}: ${e.message}")
         } finally {
             interruptStarted.set(false)
-            if (pending) {
-                try {
-                    log("[0x81] cancel=${request.cancel()}；等待回收完成")
-                    for (attempt in 1..5) {
-                        val completed = try { connection.requestWait(200) } catch (_: TimeoutException) { null }
-                        if (completed === request) {
-                            pending = false
-                            // A completion may race with Stop/cancel. Preserve its payload too.
-                            val count = buffer.position()
-                            if (count > 0) {
-                                buffer.flip()
-                                val bytes = ByteArray(count)
-                                buffer.get(bytes)
-                                received("0x81 INTERRUPT IN (停止时完成)", bytes, controlStats)
-                            }
-                            break
-                        }
-                    }
-                } catch (e: Exception) { log("[0x81] 撤销/回收异常：${e.javaClass.simpleName}: ${e.message}") }
-            }
-            if (pending) {
-                // Retain request and buffer with this session. No unsafe free/close.
-                retainedRequest = request
-                retainedBuffer = buffer
-                safeToClose.set(false)
-                fail("0x81", controlStats, "无法确认请求已回收，隔离连接；禁止释放/关闭或重新测试，请拔插设备并重启应用")
-            } else {
-                try { request.close() }
-                catch (e: Exception) { fail("0x81", controlStats, "请求资源释放异常：${e.message}") }
-            }
+            try {
+                if (life.reason == UsbStopReason.UserStop) life.stopped(failureReason)
+                if (life.state == AsyncCleanupState.Pending) {
+                    if (!devicePresent()) life.stopped(unavailableReason())
+                    if (life.drain(resources, AndroidCleanupClock, false, false) { log("[0x81 cleanup] $it") }) emit("0x81 INTERRUPT IN (停止时完成)")
+                }
+                life.close(resources) { log("[0x81 cleanup] $it") }
+            } finally { life.readerFinished() }
         }
     }
-
-    private var retainedRequest: UsbRequest? = null
-    private var retainedBuffer: ByteBuffer? = null
 }

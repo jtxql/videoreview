@@ -1,43 +1,40 @@
 # TableTennis Review
 
-用于乒乓球比赛视频复盘的 Android 应用，阶段 2A：Android USB 基础通信与初始化探索已完成，旋转协议仍未解决。播放器最终架构尚未确定。
+用于乒乓球比赛视频复盘的Android应用。**007：Completed with known limitation；008：Ready to start。** TourBox Lite协议与输入事件已在目标真机验证；物理拔出自动恢复作为USB-001延期。播放器尚未实现，最终底座/架构待确认。
 
-## 目标设备
+## 目标设备与功能
 
-- 手机：小米 14 Ultra。
-- 控制器：USB-C 有线 TourBox Lite。
-- 运行约束：不要求 Root，不依赖电脑作为运行时中介。
+- 小米14 Ultra，USB-C有线TourBox Lite；运行不要求Root，不依赖电脑中介。
+- 播放本地视频，播放/暂停、快进/快退、前进/后退一帧。
+- 0.1x、0.25x、0.5x、0.75x、1x等速度与A/B区间循环。
+- 后续通过TourBox旋钮、滚轮和按键触发播放器操作。
 
-## 计划功能
+## 007归档状态
 
-- 播放本地视频，支持播放、暂停、快进和快退。
-- 前进和后退一帧。
-- 支持 0.1x、0.25x、0.5x、0.75x、1x 等播放速度。
-- A/B 区间循环播放。
-- 通过 TourBox Lite 的旋钮、滚轮和按键控制播放器。
+`android/`当前是Kotlin/系统View的TourBox USB Diagnostics工程，不是视频播放器。支持枚举/授权、单接口连接、受控force=true、双IN读取、原始日志及导出，和独立的类型安全输入事件层。
 
-## 候选技术与待验证事项
+成功流程保持用户手动执行：双接口claim/启动读取→A1 115200/8N1→A0控制线0→单次固定8字节→完整26字节回复验证→二次确认后单次Windows原样94字节配置→0x82输入。四方向旋转及已测试按钮按下/松开、回复分流、正常停止回收和同地址正常重开已通过；007-Y的134条语义与原始字节逐一对应。详见[最终验收](docs/TOURBOX_INPUT_ACCEPTANCE_007_FINAL.md)与[输入接口](docs/TOURBOX_INPUT_EVENTS.md)。
 
-Android 应用层优先考虑 Kotlin，但最终架构尚未确定。
+**已知限制：[USB-001](docs/KNOWN_ISSUES.md)。** 物理拔出时异步请求可能无法确认回收，Strict策略下可能拒绝补充观察并隔离；当前进程可能无法再连接。保留隔离，不强制释放。自动恢复、5秒拔出后观察及完整压力/资源趋势测试未通过或未完成，不宣称所有生命周期场景通过。完全结束进程后重启仅为当前恢复建议，不保证底层资源已释放；关闭Activity/划掉最近任务不等于可靠结束进程。
 
-- mpv-android：https://github.com/mpv-android/mpv-android —— 候选播放器参考，需研究构建方式、集成边界、逐帧与变速能力及许可要求。
-- TuxBox：https://github.com/AndyCappDev/tuxbox —— 候选 USB 协议参考，需研究设备适配范围、协议信息和许可要求。
-- Android USB 枚举、授权、打开、强制占用接口及按钮接收已有用户真机结果；旋转事件、完整协议兼容性与稳定性仍待验证。
+无自动初始化或重发，无任意USB命令入口，不发送动态16字节命令，不修改固件；无串口驱动库/JNI/NDK/mpv集成。007已结束，USB-001 Deferred，不阻塞008。
 
-以上方案未完成可行性验证，不构成已确定架构或功能保证。
+## 008准备与候选技术
 
-## 当前状态与构建
+008仅准备开始Android播放器基础功能：本地文件、播放暂停、变速/慢动作、双向逐帧、快进快退、AB循环；后续订阅007语义事件，无需重写USB协议。本轮不实现008代码。
 
-阶段 1、1.5 源码研究及阶段 2A 诊断探索已完成；播放器最终架构尚未确定。用户真机确认 Lite CAFE:4001 可枚举、授权、打开并以 force=true 占用接口 0/1。双 IN 实验中，0x82 收到所有按钮按下/松开的单字节数据，0x81 未观察到数据，全部旋转控件仍无数据。
+Android应用层采用Kotlin。mpv-android仍是候选播放器参考，见[mpv源码研究](docs/MPV_RESEARCH.md)；编译/真机集成、逐帧精度及许可边界待验证。TuxBox是协议参考，见[协议研究](docs/TOURBOX_RESEARCH.md)，开源声明不等于全部Lite行为保证。最终播放器架构和重要方案仍先征求确认。
 
-A1/A2/A3 标准 CDC 请求分别返回 7/0/0；固定八字节候选经 0x02 单次发送返回 8，均未使旋转出现。这些是主机侧传输结果，不代表解锁成功。同一设备在 Windows 官方 Console 中所有旋转控件正常。完整实测表及证据边界见 [TourBox 研究总结](docs/TOURBOX_RESEARCH.md#阶段-2a-当前检查点任务-006l)。下一阶段是 [Windows 被动抓包对照](docs/USB_CAPTURE_PLAN.md)，不直接尝试94字节配置。
+## 构建与无设备检查
 
-`android/` 是独立的 **TourBox USB Diagnostics** 工程，使用 Kotlin 和系统 View，具备枚举、授权、单接口连接、受控 force=true、单/双 IN 原始监听、三个手动 CDC 请求，以及二次确认后每连接最多一次的固定候选发送。日志包含独立关键结果、原始 HEX、计数、测试标记及文件导出。它不是播放器，不解析或映射 TourBox 事件。
+固定AGP 9.2.1、Gradle 9.4.1、内置Kotlin 2.2.10、Studio JBR25，字节码17；compile/target SDK37、minSDK26、Build-Tools36.0.0。SDK路径只在被忽略的local.properties中；Android Studio打开`android/`并选择兼容JDK。
 
-安全边界：不自动初始化或重发，不提供任意 USB 写入，不发送94字节配置，不修改固件，不集成 mpv，不引入串口库、JNI/NDK。后台或旋转会结束连接；异步请求无法确认回收时隔离连接，禁止继续使用。生命周期极端竞态及高频接收完整性仍待专项验证。
+在`android/`下执行（离线需已有依赖缓存）：
 
-工具链固定为 AGP 9.2.1、Gradle 9.4.1、AGP 内置 Kotlin 2.2.10、Studio JBR 25，字节码目标17；compile/target SDK 37、min SDK 26、Build-Tools 36.0.0。SDK路径仅保存在被忽略的 local.properties。
+```powershell
+.\gradlew.bat :app:testInputEvents :app:testConfig94 :app:testUsbAsyncCleanup :app:testUsbGenerations :app:assembleDebug :app:lintDebug --offline --no-daemon --console=plain
+```
 
-Android Studio 打开 `android/` 并选择兼容 JDK。命令与检查结果见 [诊断工程说明](docs/USB_DIAGNOSTICS.md)；debug APK 位于 `android/app/build/outputs/apk/debug/app-debug.apk`，构建产物不提交。命令行构建通过不等于 IDE GUI Sync 或新增真机测试通过。
+命令行构建和上述JVM检查已执行通过，不代表IDE GUI Sync、播放器或全部设备生命周期验证通过。APK位于`android/app/build/outputs/apk/debug/app-debug.apk`，不纳入Git。原始日志、抓包、Python缓存、签名密钥、本机配置及构建产物均不提交。
 
-阶段计划见 [ROADMAP.md](ROADMAP.md)，变更记录见 [CHANGELOG.md](CHANGELOG.md)，开发规则见 [AGENTS.md](AGENTS.md)。
+历史诊断步骤见[工程说明](docs/USB_DIAGNOSTICS.md)；当前进度见[ROADMAP](ROADMAP.md)，记录见[CHANGELOG](CHANGELOG.md)，规则见[AGENTS](AGENTS.md)。

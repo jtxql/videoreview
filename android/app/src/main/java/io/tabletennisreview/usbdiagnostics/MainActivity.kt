@@ -22,6 +22,7 @@ import java.io.File
 class MainActivity : Activity() {
     private lateinit var usb: TourBoxUsbManager
     private val diagnostics = DiagnosticLog()
+    private val uiLogWriter = java.util.concurrent.Executors.newSingleThreadExecutor { task -> Thread(task, "TourBox-ui-log") }
     private lateinit var deviceSpinner: Spinner
     private lateinit var interfaceSpinner: Spinner
     private lateinit var details: TextView
@@ -84,9 +85,10 @@ class MainActivity : Activity() {
             val device = intent.usbDevice() ?: return
             if (intent.action == UsbManager.ACTION_USB_DEVICE_DETACHED) {
                 log("USB 拔出：${device.deviceName}")
-                if (usb.connectedName == device.deviceName) usb.close("USB 拔出")
+                usb.detached(device)
                 if (pendingPermission == device.deviceName) cancelPermission()
             } else {
+                usb.attached(device)
                 log("USB 接入：${device.deviceName}；未自动申请权限或连接。")
             }
             refresh()
@@ -95,7 +97,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        usb = TourBoxUsbManager(this, ::log)
+        usb = TourBoxUsbManager(this, ::log) { diagnostics.captureFailure == null && lastExperiment?.isFile == true }
         lastExperiment = File(filesDir, "unlock-experiments").listFiles()?.filter { it.isFile && it.extension == "txt" }?.maxByOrNull { it.lastModified() }
         buildUi()
         // Capture CDC and pre-send failures too, even if the unlock button stays disabled.
@@ -114,6 +116,7 @@ class MainActivity : Activity() {
             registerReceiver(attachmentReceiver, attachFilter)
         }
         receiversRegistered = true
+        usb.observing(true)
         log("诊断启动：保留 IN/CDC 实验；候选八字节仅本连接核实 CDC 返回值后手动二次确认发送一次。")
         log("后台/旋转会关闭连接；权限结果不会触发自动连接。")
     }
@@ -310,7 +313,6 @@ class MainActivity : Activity() {
         try {
             val oldName = selected?.deviceName
             devices = usb.devices()
-            if (usb.connectedName != null && devices.none { it.deviceName == usb.connectedName }) usb.close("刷新发现设备消失")
             deviceSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item,
                 devices.map { "${UsbDescriptors.hex(it.vendorId)}:${UsbDescriptors.hex(it.productId)} ${it.deviceName}" }.ifEmpty { listOf("未检测到 USB 设备") })
             val index = devices.indexOfFirst { it.deviceName == oldName }.coerceAtLeast(0)
@@ -350,7 +352,7 @@ class MainActivity : Activity() {
         configButton.isEnabled = usb.canConfig94
         exportButton.isEnabled = lastExperiment != null && !usb.isListening
         counters.text = getString(R.string.read_counters, usb.totalBytes.get(), usb.readCount.get(), if (usb.isListening) "监听中/正在停止" else "已停止") + "\n" + usb.endpointSummary()
-        status.text = getString(R.string.connection_status, usb.connectedName ?: "未连接", pendingPermission ?: "无待处理请求") + "\n" + usb.cdcEvidence()
+        status.text = listOf(getString(R.string.connection_status, usb.connectedName ?: "未连接", pendingPermission ?: "无待处理请求"), usb.cleanupStatus, usb.cdcEvidence()).joinToString("\n")
     }
 
     private fun requestPermission() {
@@ -382,6 +384,12 @@ class MainActivity : Activity() {
         pendingPermission = null
     }
     private fun log(message: String) {
+        // UI interaction messages must not append files on the main thread.
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            if (!uiLogWriter.isShutdown) uiLogWriter.execute { recordLog(message) }
+        } else recordLog(message)
+    }
+    private fun recordLog(message: String) {
         diagnostics.add(message)
         val failure = diagnostics.captureFailure
         if (failure != null && captureFailureReported.compareAndSet(false, true)) {
@@ -412,9 +420,11 @@ class MainActivity : Activity() {
         ui.removeCallbacks(render)
         cancelPermission()
         usb.shutdown()
+        uiLogWriter.shutdown()
         if (receiversRegistered) {
             unregisterReceiver(permissionReceiver)
             unregisterReceiver(attachmentReceiver)
+            usb.observing(false)
         }
         super.onDestroy()
     }
