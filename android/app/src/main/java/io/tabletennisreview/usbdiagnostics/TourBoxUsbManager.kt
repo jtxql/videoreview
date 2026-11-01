@@ -44,6 +44,46 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
     private val candidate = UnlockCandidate()
     private data class UnlockRequest(val epoch: Long, val startCapture: () -> Boolean, val captureHealthy: () -> Boolean)
     private val pendingUnlock = AtomicReference<UnlockRequest?>(null)
+    private val config94 = Config94Experiment()
+    private data class ConfigRequest(val epoch: Long, val healthy: () -> Boolean)
+    private val pendingConfig = AtomicReference<ConfigRequest?>(null)
+    val canConfig94: Boolean get() = cdcReady && !cdcBusy.get() && !stopRequested && !disposed && quarantined == null && config94.ready(epoch.get())
+    fun configToken(): Long? = if (canConfig94) epoch.get() else null
+    fun configEvidence() = config94.summary()
+    fun queueConfig94(token: Long, confirmed: Boolean, healthy: () -> Boolean) {
+        if (token != epoch.get() || !canConfig94 || !cdcBusy.compareAndSet(false, true)) return
+        if (!config94.reserve(token, confirmed)) { cdcBusy.set(false); return }
+        pendingConfig.set(ConfigRequest(token, healthy))
+        log("[配置94] 用户二次确认，本连接机会已消耗，不重试。")
+    }
+    private fun runPendingConfig(sessionEpoch: Long, session: DualEndpointSession) {
+        val command = pendingConfig.getAndSet(null) ?: return
+        try {
+            val device = connectedDevice
+            val opened = connection
+            check(command.epoch == sessionEpoch && epoch.get() == sessionEpoch && !stopRequested && !disposed && cdcReady && session.acceptingControls && quarantined == null && config94.validReserved(sessionEpoch)) { "会话或回复证据失效" }
+            check(device != null && opened != null && device.vendorId == 0xCAFE && device.productId == 0x4001 && system.deviceList[device.deviceName]?.deviceId == device.deviceId && system.hasPermission(device)) { "设备/权限失效" }
+            check(dualClaims.size == 2 && dualClaims[0].id == 0 && dualClaims[1].id == 1) { "双接口未占用" }
+            val intf = dualClaims[1]
+            val endpoint = (0 until intf.endpointCount).map { intf.getEndpoint(it) }.firstOrNull {
+                intf.id == 1 && intf.interfaceClass == 10 && intf.alternateSetting == 0 && it.address == 0x02 && it.direction == UsbConstants.USB_DIR_OUT && it.type == UsbConstants.USB_ENDPOINT_XFER_BULK && it.maxPacketSize == 64
+            } ?: error("接口1 OUT02描述符不符")
+            check(command.healthy()) { "完整日志不可用" }
+            val bytes = Config94Experiment.payload()
+            check(bytes.size == 94 && java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it.toInt() and 255) } == Config94Experiment.SHA256) { "配置常量校验失败" }
+            log("[配置94 BEGIN] endpoint=0x02 bytes=94 timeout=1000ms SHA256=${Config94Experiment.SHA256} HEX=${Config94Experiment.HEX}\n${config94.summary()}")
+            check(epoch.get() == sessionEpoch && !stopRequested && session.acceptingControls && command.healthy() && system.hasPermission(device)) { "发送前状态失效" }
+            val before = SystemClock.elapsedRealtime()
+            val result = opened.bulkTransfer(endpoint, bytes, bytes.size, 1000)
+            log("[配置94 END] result=$result expected=94 elapsed=${SystemClock.elapsedRealtime() - before}ms；仅主机侧传输结果，不表示配置生效")
+            check(result == 94 && command.healthy()) { "短写/失败/日志故障，不补发" }
+            check(epoch.get() == sessionEpoch && session.acceptingControls && system.deviceList[device.deviceName]?.deviceId == device.deviceId && system.hasPermission(device)) { "完成时会话失效" }
+            log("[配置94] 保持原始IN观察，本连接不再发送任何初始化。")
+        } catch (e: Exception) {
+            log("[配置94 FAILED] ${e.javaClass.simpleName}: ${e.message}；停止，不重试或恢复")
+            stopRequested = true; cdcReady = false; epoch.incrementAndGet()
+        } finally { cdcBusy.set(false) }
+    }
     val canCdc: Boolean get() = cdcReady && !cdcBusy.get() && !candidate.used() && !stopRequested && !disposed && quarantined == null
     val canUnlock: Boolean get() = canCdc && candidate.ready()
     fun unlockToken(): Long? = if (canUnlock) epoch.get() else null
@@ -77,7 +117,9 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
             check(epoch.get() == sessionEpoch && !stopRequested && session.acceptingControls && system.hasPermission(device) && command.captureHealthy()) { "发送前状态或实验日志变化" }
             val before = SystemClock.elapsedRealtime()
             val bytes = UnlockCandidate.payload()
+            config94.begin(sessionEpoch, SystemClock.elapsedRealtime())
             val result = opened.bulkTransfer(endpoint, bytes, bytes.size, 1000)
+            config94.sent(result)
             log("[候选 TX END] result=$result expected=8 elapsed=${SystemClock.elapsedRealtime() - before}ms；${if (result == 8) "仅主机侧完整发送，未证明解锁" else "发送失败/短写，禁止补发"}")
             check(result == 8) { "非完整发送 $result，设备可能已收到部分数据" }
             check(command.captureHealthy()) { "实验日志不完整，停止采集" }
@@ -118,6 +160,7 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
             check(result == action.expected) { "负返回/短传输/非预期返回：$result，不自动重试" }
             check(epoch.get() == sessionEpoch && session.acceptingControls && system.deviceList[device.deviceName]?.deviceId == device.deviceId && system.hasPermission(device)) { "请求完成时会话/设备已失效" }
             candidate.record(action, result)
+            config94.record(action, result)
             log("[CDC 返回核实] ${candidate.summary()}")
         } catch (e: Exception) {
             log("[CDC ${action.name} FAILED] ${e.javaClass.simpleName}: ${e.message}；停止本轮，不自动重试或恢复。")
@@ -344,6 +387,8 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
                     { stopRequested || epoch.get() != request },
                     { system.deviceList[current.deviceName]?.deviceId == current.deviceId && system.hasPermission(current) },
                     { source, bytes, stats ->
+                        if (source == "0x82 BULK IN" && config94.observe(request, bytes, SystemClock.elapsedRealtime()))
+                            log("[配置94 回复证据] 完整26字节已按流匹配（可跨读取块），RX结束序号=${readCount.get() + 1}；原始块继续完整记录")
                         stats.reads.incrementAndGet(); stats.bytes.addAndGet(bytes.size.toLong())
                         readCount.incrementAndGet(); totalBytes.addAndGet(bytes.size.toLong())
                         log("[$source] RX bytes=${bytes.size} HEX=" + bytes.joinToString(" ") { "%02X".format(it.toInt() and 0xFF) })
@@ -351,6 +396,7 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
                 session.onCoordinatorTick = {
                     runPendingCdc(request, session)
                     runPendingUnlock(request, session)
+                    runPendingConfig(request, session)
                 }
                 cdcReady = true
                 log("[CDC] 双接口已占用，A1/A2/A3 可分别手动触发；不会自动初始化。")
@@ -371,6 +417,8 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit) {
     private fun closeInternal(reason: String) {
         cdcReady = false
         candidate.reset()
+        config94.reset()
+        if (pendingConfig.getAndSet(null) != null) log("[配置94] 取消未发送请求：$reason")
         if (pendingUnlock.getAndSet(null) != null) log("[候选 TX] 已取消未发送请求，不重发：$reason")
         if (pendingCdc.getAndSet(null) != null) log("[CDC] 取消尚未发送的手动请求：$reason")
         cdcBusy.set(false)

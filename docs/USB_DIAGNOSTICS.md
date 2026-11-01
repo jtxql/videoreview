@@ -151,3 +151,34 @@ Android bulkTransfer 的负返回并非可靠 errno：首次标明“超时或 I
 本轮未改Android文件。离线 `help :app:assembleDebug :app:lintDebug --offline --no-daemon --console=plain` 成功，45项任务中9项执行、36项最新；没有强制重跑全部任务。Lint为0错误/8项既有警告（Gradle更新提示、旧API备份配置、诊断文字国际化），未屏蔽或升级处理。
 
 APK签名验证通过，路径仍为 `android/app/build/outputs/apk/debug/app-debug.apk`；SHA-256 `804090D552EA75A7A41D7B8997B9509399589ED03DCFED3F68462AC664987D84`，与日志修正版一致。JDK对apksigner打印native-access未来限制提示，当前验证成功。本轮未重跑历史临时JVM夹具，仓库无独立自动化测试套件；未执行IDE GUI Sync或任何USB/手机操作。用户实测统一见阶段2A研究总结，不将构建结果替代硬件验证。
+
+
+## 006P：控制线状态0单变量实验（待真机验证）
+
+新增手动A0：EP0 bmRequestType=0x21、bRequest=0x22、wValue=0、wIndex=0、wLength=0、无payload、timeout=1000ms，预期返回0。A1仍设置115200/8N1；A2/A3原功能保留。双claim、IN线程/200ms等待、固定8字节/1000ms及单次二次确认均不变，无动态16字节或94字节配置。
+
+新门控要求A1返回7，且最后一个控制线动作A0成功；旧A1/A2/A3路径也保留。界面及确认显示各返回值、lastControl，便于区分路径。A0之后若误点A2/A3，不得继续称为006P单变量实验，应停止并断电新建会话，不通过追加A0掩盖混杂。
+
+步骤：控制器实际断电重连，保持应用前台和固定方向 → 授权、手动确认双接口force=true并监听 → 添加006P基线标记 → A1返回7 → A0返回0 → 二次确认固定8字节一次，检查TX返回8和26字节RX（允许跨块） → 分别标记Knob顺/逆、Scroll上/下，每组间停约3秒 → 停止，等待读取退出/release/close → 导出当前/历史日志中的本轮完整TXT。不要只复制屏幕快照，不把传输成功当旋转成功。文件记录未知字节，不过滤旋转候选码。
+
+A0关闭DTR/RTS可能改变设备状态或导致重枚举；失败按已有机制停止，不自动重试/恢复。若观察到44/04/49/09，应重复新会话确认；若无，仅表明本轮A1+A0+8字节不足，不证明线状态完全无关。未自动连接、安装、访问设备或执行本实验。
+
+006P实际验证：修改后的debug构建及lint通过（0错误/8条既有警告），APK签名通过；SHA256 `404D5061E77856587EBB95637C42CADFC46E85C916761EF6B2BEDB5ABE613FE0`。项目外JVM检查对实际编译类验证A0参数、未知/失败门控、最后控制线覆盖、旧路径兼容、单次reserve及reset通过。首次测试使用旧AGP类目录导致classpath错误，定位built_in_kotlinc实际产物后通过；未据此改应用逻辑。构建/检查不代表真机实验成功。未安装APK或访问设备，未提交Git。
+
+
+## 006Q-B：独立94字节配置实验（未真机验证，等待批准）
+
+实现依据[006Q-A方案](TOURBOX_94BYTE_EXPERIMENT_PLAN.md)。标题为006Q-B 94字节实验版；新增“单次94字节配置实验（需二次确认）”。固定Windows原样94字节，SHA256 bd5c3ea003dc6cee06182d710381f71844a4f7a38183f15e952224f21f8414a1，已与W2/W3全部13条逐字节核对，不使用TuxBox/Detour差异版本。
+
+门控：本连接严格A1成功→A0成功且不混入A2/A3，原八字节返回8；从其native发送前启用3秒回复观察窗，完整匹配指定26字节，可跨读取块且允许回复早于TX END。超窗未匹配不开放；只旁路匹配，未知字节仍完整记录。匹配记录RX结束序号和主机时间。失败不能开放，旧会话证据不能复用。原legacy按钮流程保留但不开放配置。
+
+用户再次确认才原子reserve并排队，取消对话框不发送；确认后本连接机会已用，未发即取消/失败也不返还。协调器发送前重核epoch、双claim、权限、端点和完整日志；OUT02一次bulkTransfer94/1000ms，返回94仅表示主机完整发送，不表示固件接受或旋转成功。短写/异常/日志失败停止不重试、不补尾、不恢复，IN原线程继续，停止先等写/读退出再释放。无法回收异步请求仍隔离。
+
+真机步骤须另行批准后进行：物理重连→授权双IN→A1→A0→八字节及26字节证据→同会话原始输入基线及标记→94字节入口阅读完整HEX/哈希/风险并确认一次→标记四方向与按钮测试→停止等退出及release/close→导出完整TXT。应用不发送动态16字节，不自动配置；关闭应用/断电不保证恢复未知持久状态。原始日志/抓包不提交。
+
+
+006Q-B实际验证：离线assembleDebug/lintDebug成功（44项任务，18执行/26最新），lint 0错误/9警告；增加的诊断文字国际化提示未屏蔽。APK签名通过，SHA256 `0D0DB9A08091381A38BC46E41CE8F027E6393ABBD74A8F81DE8C9CE2A2699C6D`。apksigner的JDK native-access提示不影响本次成功验证。
+
+纯JVM夹具保存在 `scripts/tests/Config94Check.java`，已对实际编译类运行：94字节/哈希及独立payload、25个分割点、回复早于TX返回、缺失/错误/超时回复、A2混入/反序、八字节短写、未确认拒绝、32线程单次reserve、旧epoch/reset全部通过。完整常量另与W2/W3共13条逐字节核对。静态审查确认配置执行函数只有一个bulkTransfer且无重试循环、UI仅positive确认回调排队，原RX记录不删改。夹具不是Android系统/实际USB竞态验证，不声称真机通过。
+
+复现夹具：先构建debug，再用JDK的javac（UTF-8）将测试编译到项目外临时目录；classpath包含 `android/app/build/intermediates/built_in_kotlinc/debug/compileDebugKotlin/classes` 和已缓存的Kotlin stdlib 2.2.10 JAR。用相同classpath加测试输出目录运行 `java Config94Check`；不调用ADB或USB。本轮未安装/启动APK、访问设备或创建Git提交，等待用户明确批准真机测试。

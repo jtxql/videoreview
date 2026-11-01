@@ -30,7 +30,7 @@ class DiagnosticLog {
     @Synchronized fun add(message: String) {
         val record = "${LocalTime.now().format(TIME)}  $message"
         // Keep request outcomes outside the RX ring, including failures and negatives.
-        if (message.startsWith("[CDC A") || message.startsWith("[候选 TX")) {
+        if (message.startsWith("[CDC A") || message.startsWith("[候选 TX") || message.startsWith("[配置94")) {
             val key = message.substringBefore(']')
             important[key] = record
             while (important.size > 32) important.remove(important.keys.first())

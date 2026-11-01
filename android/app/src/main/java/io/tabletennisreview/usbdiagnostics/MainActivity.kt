@@ -36,6 +36,8 @@ class MainActivity : Activity() {
     private lateinit var dualButton: Button
     private var dualConfirmation: AlertDialog? = null
     private val cdcButtons = mutableListOf<Button>()
+    private lateinit var configButton: Button
+    private var configConfirmation: AlertDialog? = null
     private lateinit var unlockButton: Button
     private lateinit var exportButton: Button
     private lateinit var evidenceView: TextView
@@ -132,7 +134,7 @@ class MainActivity : Activity() {
             insets
         }
         fun text(value: String) = TextView(this).apply { text = value; root.addView(this) }
-        text("TourBox USB Diagnostics · 006J 日志修正版").textSize = 21f
+        text("TourBox USB Diagnostics · 006Q-B 94字节实验版").textSize = 21f
         text("选择设备 → 申请权限 → 选择接口（可不选）→ 点击连接")
         Button(this).apply { text = "刷新设备"; setOnClickListener { refresh() }; root.addView(this) }
         status = text("未连接")
@@ -208,7 +210,7 @@ class MainActivity : Activity() {
             }
             root.addView(this)
         }
-        text("标准 CDC 实验：需先启动双接口监听。A2 会将 RTS 设低；请求成功不代表旋转成功。不会自动恢复线状态。")
+        text("006P：新会话先A1（返回7），再A0（返回0），不要点击A2/A3，再二次确认八字节。A0关闭DTR/RTS，可能影响设备状态。旧A1/A2/A3流程仍保留；传输成功不代表旋转成功，不自动恢复。")
         for (action in CdcAction.entries) {
             cdcButtons.add(Button(this).apply {
                 text = action.label
@@ -223,12 +225,28 @@ class MainActivity : Activity() {
                 val token = usb.unlockToken() ?: return@setOnClickListener
                 unlockConfirmation = AlertDialog.Builder(this@MainActivity)
                     .setTitle("确认单次候选命令")
-                    .setMessage("固定 TX：${UnlockCandidate.HEX}\n接口1 BULK OUT 0x02，1000ms，当前连接最多一次。\n${usb.cdcEvidence()}\n来源为 TuxBox 的 Elite 逆向序列，尚未确认适用于 Lite；可能改变设备状态，无法保证断电恢复。短写/失败不补发，不发送其他配置。确认后保持 IN 接收并保存实验文件。")
+                    .setMessage("固定 TX：${UnlockCandidate.HEX}\n接口1 BULK OUT 0x02，1000ms，当前连接最多一次。\n${usb.cdcEvidence()}\n006P应仅执行A1→A0；若混入A2/A3请停止并新建会话。来源为 TuxBox 的 Elite 逆向序列，尚未确认适用于 Lite；可能改变设备状态，无法保证断电恢复。短写/失败不补发，不发送其他配置。确认后保持 IN 接收并保存实验文件。")
                     .setNegativeButton("取消", null)
                     .setPositiveButton("确认发送这8字节一次") { _, _ ->
                         usb.queueUnlock(token, {
                             lastExperiment?.isFile == true && diagnostics.captureFailure == null
                         }, { diagnostics.captureFailure == null })
+                        showSelected()
+                    }.show()
+            }
+            root.addView(this)
+        }
+        configButton = Button(this).apply {
+            text = "单次94字节配置实验（需二次确认）"
+            isEnabled = false
+            setOnClickListener {
+                val token = usb.configToken() ?: return@setOnClickListener
+                configConfirmation = AlertDialog.Builder(this@MainActivity)
+                    .setTitle("确认一次94字节配置")
+                    .setMessage("仅本会话A1→A0、八字节发送成功且完整26字节回复核实后允许。\n${usb.configEvidence()}\n接口1 OUT02，94字节，1000ms。\nSHA256=${Config94Experiment.SHA256}\nHEX=${Config94Experiment.HEX}\n可能改变输入模式或设备配置，持久化未知，关闭应用或断电不保证恢复。短写/失败不补发。请先完成发送前基线并加标记；确认后仅一次，保持原始RX。")
+                    .setNegativeButton("取消", null)
+                    .setPositiveButton("确认发送这94字节一次") { _, _ ->
+                        usb.queueConfig94(token, confirmed = true) { lastExperiment?.isFile == true && diagnostics.captureFailure == null }
                         showSelected()
                     }.show()
             }
@@ -329,6 +347,7 @@ class MainActivity : Activity() {
         dualButton.isEnabled = device != null && hasPermission && !usb.isListening
         cdcButtons.forEach { it.isEnabled = usb.canCdc }
         unlockButton.isEnabled = usb.canUnlock
+        configButton.isEnabled = usb.canConfig94
         exportButton.isEnabled = lastExperiment != null && !usb.isListening
         counters.text = getString(R.string.read_counters, usb.totalBytes.get(), usb.readCount.get(), if (usb.isListening) "监听中/正在停止" else "已停止") + "\n" + usb.endpointSummary()
         status.text = getString(R.string.connection_status, usb.connectedName ?: "未连接", pendingPermission ?: "无待处理请求") + "\n" + usb.cdcEvidence()
@@ -377,6 +396,8 @@ class MainActivity : Activity() {
         refresh()
     }
     override fun onStop() {
+        configConfirmation?.dismiss()
+        configConfirmation = null
         unlockConfirmation?.dismiss()
         unlockConfirmation = null
         dualConfirmation?.dismiss()
