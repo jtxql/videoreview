@@ -1,0 +1,27 @@
+# Local Android / Gradle configuration and outputs
+.gradle/
+.kotlin/
+**/build/
+local.properties
+.externalNativeBuild/
+.cxx/
+
+# IDE and machine-local files
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Signing secrets and local environment
+*.jks
+*.keystore
+keystore.properties
+.env
+.env.*
+!.env.example
+
+# Generated packages and logs
+*.apk
+*.aab
+*.log
