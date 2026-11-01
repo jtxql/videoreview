@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="read_counters">累计读取：%1$d 字节 / %2$d 次；%3$s</string>
+    <string name="force_claim_option">尝试强制占用接口（force=true，仅本次连接）</string>
+    <string name="force_claim_warning">默认 force=false。勾选后，force=true 可能临时断开系统驱动对所选 USB 接口的控制；仅测试一个接口。关闭连接会尝试释放，但不能保证系统驱动立即恢复，必要时请拔插设备。</string>
+    <string name="connection_status">连接：%1$s；权限申请：%2$s</string>
+</resources>
