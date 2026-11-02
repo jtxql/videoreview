@@ -36,6 +36,17 @@ sealed interface CommandAdmission {
     data object Accepted : CommandAdmission
     data class Rejected(val reason: String) : CommandAdmission
 }
+data class PlayerExportSnapshot(val sessionId: Long, val a: Double, val b: Double, val speed: Double, val duration: Double) {
+    init {
+        require(sessionId > 0)
+        LoopPoints(a, b).enabled(duration)
+        require(speed.isFinite() && PlayerPolicy.speeds.any { kotlin.math.abs(it - speed) < 0.000001 }) { "导出速度无效" }
+    }
+}
+sealed interface ExportPreparation {
+    data class Ready(val snapshot: PlayerExportSnapshot) : ExportPreparation
+    data class Rejected(val reason: String) : ExportPreparation
+}
 /** All entry points/listeners are main-thread owned; commands perform native work off the UI. */
 interface PlayerController {
     val state: PlayerState
@@ -45,6 +56,7 @@ interface PlayerController {
     fun execute(command: PlayerCommand): CommandAdmission
     /** Short authorization, rechecked before each native request; never hold USB locks around native code. */
     fun executeGuarded(command: PlayerCommand, authorization: () -> Boolean, origin: String): CommandAdmission
+    fun prepareExport(callback: (ExportPreparation) -> Unit): CommandAdmission
     fun pauseForPageChange()
     fun release(reason: String)
     fun close()

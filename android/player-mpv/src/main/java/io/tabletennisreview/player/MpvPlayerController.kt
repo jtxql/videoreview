@@ -40,9 +40,9 @@ internal class MpvPlayerController(private val video: MpvView) : PlayerControlle
         val token = epoch.begin()
         preparing = true
         emit(PlayerState(sessionId = token, phase = PlayerPhase.Initializing, busy = true, message = "后台初始化中"))
-        val options = MpvOptions(displayFps = video.display?.refreshRate?.toDouble(), extra = mapOf("pause" to "yes", "tls-verify" to "yes"))
+        val options = MpvOptions(displayFps = video.display?.refreshRate?.toDouble(), extra = mapOf("pause" to "yes", "tls-verify" to "yes", "loop-file" to "inf"))
         val app = video.context.applicationContext
-        log("INIT BEGIN session=$token; using built-in content protocol")
+        log("INIT BEGIN session=$token; using built-in content protocol; loop-file=inf")
         starter.execute {
             var stage = "create"
             val result = runCatching {
@@ -205,6 +205,44 @@ internal class MpvPlayerController(private val video: MpvView) : PlayerControlle
             }
         }
         return CommandAdmission.Accepted
+    }
+
+    override fun prepareExport(callback: (ExportPreparation) -> Unit): CommandAdmission {
+        mainOnly()
+        val player = core ?: return CommandAdmission.Rejected("请先加载视频")
+        val jobs = scope ?: return CommandAdmission.Rejected("播放器未就绪")
+        val token = state.sessionId
+        val points = state.loop
+        if (closed || !epoch.isCurrent(token) || !state.loaded || state.busy || points.a == null || points.b == null)
+            return CommandAdmission.Rejected("请先标记有效A/B，并等当前操作结束")
+        emit(state.copy(busy = true))
+        log("EXPORT SNAPSHOT BEGIN session=$token A=${points.a} B=${points.b}")
+        jobs.launch {
+            val result: ExportPreparation = try {
+                withTimeout(15_000) {
+                    fun valid() { requireExportSourceCurrent(token, player) }
+                    currentCoroutineContext().ensureActive(); valid()
+                    player.setString("pause", "yes").getOrThrow()
+                    currentCoroutineContext().ensureActive(); valid()
+                    val speed = player.getAsync(MpvProperties.Speed).getOrThrow()
+                    currentCoroutineContext().ensureActive(); valid()
+                    val duration = player.getAsync(MpvProperties.Duration).getOrThrow()
+                    currentCoroutineContext().ensureActive(); valid()
+                    ExportPreparation.Ready(PlayerExportSnapshot(token, points.a, points.b, speed, duration))
+                }
+            } catch (error: Exception) { ExportPreparation.Rejected("冻结导出参数失败：${error.javaClass.simpleName}: ${error.message}") }
+            main.post {
+                val current = epoch.isCurrent(token) && core === player && !closed
+                if (current) emit(state.copy(busy = false))
+                val delivered = if (current) result else ExportPreparation.Rejected("原播放器会话已失效")
+                log("EXPORT SNAPSHOT END session=$token result=$delivered")
+                callback(delivered)
+            }
+        }
+        return CommandAdmission.Accepted
+    }
+    private fun requireExportSourceCurrent(token: Long, player: Mpv) {
+        if (!epoch.isCurrent(token) || core !== player) throw CancellationException("导出来源会话失效")
     }
 
     override fun pauseForPageChange() {

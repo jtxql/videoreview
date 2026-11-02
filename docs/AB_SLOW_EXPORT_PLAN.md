@@ -1,8 +1,8 @@
 # A/B慢动作导出实施建议
 
-状态：2026-11-02，用户已确认独立Media3导出方案及依赖下载，要求先提交现有工作，再实施导出；本检查点尚未实现导出。用户已确认：按当前播放倍速生成慢动作视频，而非仅原速截取。
+状态：2026-11-02，用户已确认独立Media3导出方案及依赖下载，要求先提交现有工作，再实施导出；提交568fb89记录了检查点；随后已开始按本方案实施，当前结果见[实现说明](AB_SLOW_EXPORT.md)。用户已确认：按当前播放倍速生成慢动作视频，而非仅原速截取。
 
-## 已确认事实
+## 方案制定时确认的事实（历史）
 
 - 当前工程只有:app和:player-mpv；PlayerController暴露播放控制，A/B在LoopPoints中，尚无视频导出接口。已有“导出播放器日志”不是视频导出。
 - libmpv依赖记录中虽列出FFmpeg，不代表已有可直接调用的FFmpeg导出SDK/可执行文件；本次未确认该预编译组合的编码能力。
@@ -10,7 +10,7 @@
 - [官方Transformer指南](https://developer.android.com/media/media3/transformer)说明基于Android MediaCodec及OpenGL处理；[裁剪/格式配置](https://developer.android.com/media/media3/transformer/transformations)支持按时间裁剪并配置H.264/AAC。
 - [EditedMediaItem.Builder](https://developer.android.com/reference/androidx/media3/transformer/EditedMediaItem.Builder)提供setSpeed；[官方发布页](https://developer.android.com/jetpack/androidx/releases/media3)目前标注稳定版1.11.1。具体AAR构建约束与本项目兼容性尚未下载核验。
 
-## 推荐方式（待确认）
+## 已批准的实施方式
 
 增加独立:video-export库模块，候选使用Media3 Transformer 1.11.1及必要同版本依赖；mpv继续负责播放，007 USB层不变。不将播放器替换为ExoPlayer，不新增手写JNI/NDK或自编译FFmpeg，不自动升级当前AGP/Gradle/Kotlin。若依赖不兼容，报告具体约束再决定。
 
@@ -42,4 +42,4 @@
 - [官方格式限制](https://developer.android.com/media/media3/transformer/supported-formats)指出编码依赖设备MediaCodec；4K、高帧率、HDR/杜比视界与播放器共占编解码资源需专项验收。mpv能播放不等于Transformer能解码/导出。
 - 保存输出不能用进度100%代替文件复制/关闭成功；失败不能留下看似成功的最终成片。未经过真机验证前，不声称慢动作成片、音频或精度已通过。
 
-本轮未修改Android代码、下载依赖、编译、安装APK、访问手机/USB、暂存或提交Git。仅新增本方案并将路线图/变更记录标为待确认，保留全部已有修改和抓包。
+方案整理阶段未修改Android代码或下载依赖。随后用户批准先提交现有工作（568fb89），再实施Media3方案并下载依赖；具体实现及实际验证另见AB_SLOW_EXPORT.md。实现阶段未安装APK或访问手机/USB，未再自动提交Git。

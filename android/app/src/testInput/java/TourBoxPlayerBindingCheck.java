@@ -48,6 +48,7 @@ public final class TourBoxPlayerBindingCheck {
             ok(!source.gate);ok(origin.contains("usbSession=7"));
             commands.add(c);guards.add(a);emit(state(state.getSessionId(),true));return CommandAdmission.Accepted.INSTANCE;
         }
+        public CommandAdmission prepareExport(Function1<? super ExportPreparation,Unit> callback){throw new AssertionError("mapping must not start export");}
         public void pauseForPageChange(){} public void release(String why){} public void close(){}
     }
     static final class Test implements AutoCloseable {

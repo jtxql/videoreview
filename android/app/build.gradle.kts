@@ -11,8 +11,8 @@ android {
         applicationId = "io.tabletennisreview.usbdiagnostics"
         minSdk = 26
         targetSdk = 37
-        versionCode = 9
-        versionName = "0.4.5-vertical-hud"
+        versionCode = 15
+        versionName = "0.5.5-ab-markers"
         ndk { abiFilters += "arm64-v8a" }
     }
     compileOptions {
@@ -71,7 +71,10 @@ tasks.register<JavaExec>("testUsbGenerations") {
 }
 tasks.named("check") { dependsOn("testUsbGenerations") }
 
-dependencies { implementation(project(":player-mpv")) }
+dependencies {
+    implementation(project(":player-mpv"))
+    implementation(project(":video-export"))
+}
 
 // The standard app check also includes the new pure player contract checks.
 tasks.named("check") { dependsOn(":player-mpv:testPlayer") }
@@ -96,3 +99,5 @@ tasks.register<JavaExec>("testPlayerUi") {
     mainClass.set("PlayerUiCheck")
 }
 tasks.named("check") { dependsOn("testPlayerUi") }
+
+tasks.named("check") { dependsOn(":video-export:testClipExport") }

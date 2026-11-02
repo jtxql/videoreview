@@ -112,6 +112,22 @@ public final class PlayerCheck {
         ok(policy.shiftSpeed(0,0.5).getSpeed()==0.5);
         rejects(()->policy.shiftSpeed(5,0.5));rejects(()->policy.shiftSpeed(1,Double.NaN));rejects(()->policy.shiftSpeed(1,0.3));
         rejects(()->plan(new PlayerCommand.ShiftSpeed(1)));
+        PlayerExportSnapshot snapshot=new PlayerExportSnapshot(1,1,3,0.25,10);
+        ok(snapshot.getA()==1&&snapshot.getB()==3&&snapshot.getSpeed()==0.25);
+        rejects(()->new PlayerExportSnapshot(0,1,3,1,10));rejects(()->new PlayerExportSnapshot(1,3,1,1,10));
+        rejects(()->new PlayerExportSnapshot(1,1,3,0.3,10));rejects(()->new PlayerExportSnapshot(1,1,3,1,2));
+        VideoViewport v=new VideoViewport();
+        ok(v.getScale()==1&&!v.getEnlarged());
+        v.zoom(2,75,50,100,100);ok(v.getScale()==2&&v.getX()==-25&&v.getY()==0);
+        v.pan(1000,-1000,100,100);ok(v.getX()==50&&v.getY()==-50);
+        v.zoom(100,50,50,100,100);ok(v.getScale()==4);
+        v.zoom(0.001,50,50,100,100);ok(v.getScale()==1&&v.getX()==0&&v.getY()==0);
+        v.zoom(Double.NaN,50,50,100,100);ok(v.getScale()==1);
+        v.zoom(2,50,50,0,100);ok(v.getScale()==1);
+        v.zoom(2,50,50,100,100);ok(v.getScale()==2&&v.getX()==0);
+        v.pan(10,20,100,100);ok(v.getX()==10&&v.getY()==20);
+        v.pan(Double.NaN,0,100,100);ok(v.getX()==10);
+        v.reset();ok(v.getScale()==1&&v.getX()==0&&v.getY()==0);
         System.out.println("PlayerCheck: " + count + " assertions passed; pure policy/plans/epoch only, no Android/native");
     }
 }

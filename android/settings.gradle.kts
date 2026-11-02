@@ -16,4 +16,4 @@ dependencyResolutionManagement {
     }
 }
 rootProject.name = "TourBoxUsbDiagnostics"
-include(":app", ":player-mpv")
+include(":app", ":player-mpv", ":video-export")

@@ -1,11 +1,9 @@
 package io.tabletennisreview.playback
 
-/** Authorization controls preference availability; initialized session separately gates real actions. */
+/** No user preference: initialized/authorized sessions enable control automatically; faults stay stopped. */
 object TourBoxControlUiPolicy {
-    fun wanted(wasAuthorized: Boolean, authorized: Boolean, previous: Boolean): Boolean =
-        authorized && (!wasAuthorized || previous)
-    fun selectable(foreground: Boolean, visible: Boolean, authorized: Boolean, bound: Boolean): Boolean =
-        foreground && visible && authorized && bound
+    fun automatic(authorized: Boolean, sessionReady: Boolean, faulted: Boolean): Boolean =
+        authorized && sessionReady && !faulted
 }
 /** Overlay visibility survives periodic playback updates, but resets on entering landscape. */
 class PlayerProgressOverlay {
@@ -44,5 +42,14 @@ class PlayerVerticalGesture(private val x: Double, private val y: Double,
             locked = true
         }
         return VerticalChange(control, ((y - currentY) / stepPixels).toInt().coerceIn(-1000, 1000))
+    }
+}
+
+/** Unknown duration or out-of-range marks are not presented as real positions. */
+object ProgressMarkers {
+    fun fraction(position: Double?, duration: Double?): Double? {
+        if (position == null || duration == null || !position.isFinite() || !duration.isFinite() ||
+            duration <= 0 || position < 0 || position > duration) return null
+        return position / duration
     }
 }

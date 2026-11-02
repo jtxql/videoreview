@@ -22,6 +22,7 @@ import io.tabletennisreview.playback.PlayerPanel
 
 class MainActivity : Activity() {
     private lateinit var playerPanel: PlayerPanel
+    private var diagnosticsDialog: AlertDialog? = null
     private var playerPageVisible = true
     private var hostActive = false
     private var fullscreen = false
@@ -141,7 +142,7 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         usb = TourBoxUsbManager(this, ::log) { diagnostics.captureFailure == null && lastExperiment?.isFile == true }
         lastExperiment = File(filesDir, "unlock-experiments").listFiles()?.filter { it.isFile && it.extension == "txt" }?.maxByOrNull { it.lastModified() }
-        playerPageVisible = savedInstanceState?.getBoolean("review.playerPage", true) ?: true
+        playerPageVisible = true // Diagnostics is now a transient dialog, never a restored page.
         val version = installedVersion()
         title = "TableTennis Review $version"
         buildUi()
@@ -363,10 +364,8 @@ class MainActivity : Activity() {
         root.addView(ScrollView(this).apply { addView(logView) }, LinearLayout.LayoutParams(-1, panelHeight))
         val diagnosticsPage = ScrollView(this).apply { isFillViewport = true; addView(root) }
         playerPanel = PlayerPanel(this)
-        val pages = FrameLayout(this).apply {
-            addView(diagnosticsPage, FrameLayout.LayoutParams(-1, -1))
-            addView(playerPanel, FrameLayout.LayoutParams(-1, -1))
-        }
+        root.addView(playerPanel.diagnosticsView(), 0)
+        val pages = FrameLayout(this).apply { addView(playerPanel, FrameLayout.LayoutParams(-1, -1)) }
         val host = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         host.setOnApplyWindowInsetsListener { view, insets ->
             @Suppress("DEPRECATION")
@@ -374,15 +373,22 @@ class MainActivity : Activity() {
                 insets.systemWindowInsetRight, insets.systemWindowInsetBottom)
             insets
         }
-        val tabs = LinearLayout(this)
-        fun showPlayer(show: Boolean) {
-            playerPanel.setPageVisible(show)
-            playerPageVisible = show
-            playerPanel.visibility = if (show) View.VISIBLE else View.GONE
-            diagnosticsPage.visibility = if (show) View.GONE else View.VISIBLE
+        playerPanel.onDiagnosticsRequested = {
+            if (diagnosticsDialog == null) {
+                playerPanel.setPageVisible(false); playerPageVisible = false
+                val dialog = AlertDialog.Builder(this).setTitle("USB诊断 / $title")
+                    .setView(diagnosticsPage).setPositiveButton("关闭", null).create()
+                diagnosticsDialog = dialog
+                dialog.setOnDismissListener {
+                    (diagnosticsPage.parent as? android.view.ViewGroup)?.removeView(diagnosticsPage)
+                    diagnosticsDialog = null; playerPageVisible = true
+                    if (!destroyed && hostActive) playerPanel.setPageVisible(true)
+                }
+                dialog.show()
+                dialog.window?.setLayout((resources.displayMetrics.widthPixels * 0.94).toInt(),
+                    (resources.displayMetrics.heightPixels * 0.88).toInt())
+            }
         }
-        tabs.addView(Button(this).apply { text = "播放器"; setOnClickListener { showPlayer(true) } }, LinearLayout.LayoutParams(0, -2, 1f))
-        tabs.addView(Button(this).apply { text = "USB诊断"; setOnClickListener { showPlayer(false) } }, LinearLayout.LayoutParams(0, -2, 1f))
         playerPanel.onFullscreenChanged = { value ->
             fullscreen = value
             if (Build.VERSION.SDK_INT >= 33) {
@@ -391,7 +397,6 @@ class MainActivity : Activity() {
                     onBackInvokedDispatcher.registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, callback)
                 } else fullscreenBack?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }
             }
-            tabs.visibility = if (value) View.GONE else View.VISIBLE
             requestedOrientation = if (value) android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE else android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             if (Build.VERSION.SDK_INT >= 30) {
                 window.insetsController?.apply {
@@ -404,9 +409,8 @@ class MainActivity : Activity() {
             }
             host.requestApplyInsets()
         }
-        host.addView(tabs)
         host.addView(pages, LinearLayout.LayoutParams(-1, 0, 1f))
-        showPlayer(playerPageVisible)
+        playerPanel.setPageVisible(true)
         setContentView(host)
     }
 
@@ -509,6 +513,7 @@ class MainActivity : Activity() {
     override fun onStart() {
         super.onStart()
         hostActive = true; autoOpened.clear(); discoveryFailed = false
+        playerPanel.setPageVisible(diagnosticsDialog == null)
         playerPanel.onHostStart()
         ui.removeCallbacks(autoTick); ui.postDelayed(autoTick, 200)
     }
@@ -522,7 +527,9 @@ class MainActivity : Activity() {
         refresh()
     }
     override fun onStop() {
-        hostActive = false; ui.removeCallbacks(autoTick); playerPanel.setTourBoxState(false, null)
+        hostActive = false // Dismiss must not reactivate playback while entering the background.
+        diagnosticsDialog?.dismiss()
+        ui.removeCallbacks(autoTick); playerPanel.setTourBoxState(false, null)
         runCatching { playerPanel.onHostStop() }.onFailure { log("播放器后台清理异常：${it.message}") }
         configConfirmation?.dismiss()
         configConfirmation = null

@@ -4,15 +4,10 @@ public final class PlayerUiCheck {
     static void ok(boolean value){count++;if(!value)throw new AssertionError("UI policy "+count);}
     public static void main(String[] args) {
         TourBoxControlUiPolicy p=TourBoxControlUiPolicy.INSTANCE;
-        boolean wanted=p.wanted(false,false,false);ok(!wanted);ok(!p.selectable(true,true,false,true));
-        // Initial Allow callback: preference is usable before an initialized session or video exists.
-        wanted=p.wanted(false,true,wanted);ok(wanted);ok(p.selectable(true,true,true,true));
-        wanted=p.wanted(true,true,wanted);ok(wanted); // initialized session arrives / periodic refresh
-        wanted=false;wanted=p.wanted(true,true,wanted);ok(!wanted); // explicit opt-out stays off
-        ok(!p.selectable(false,true,true,true));ok(!p.selectable(true,false,true,true));ok(!p.selectable(true,true,true,false));
-        wanted=p.wanted(true,false,true);ok(!wanted);wanted=p.wanted(false,true,wanted);ok(wanted);
-        // A permission UI pause/resume does not permanently gray the preference.
-        ok(p.selectable(true,true,true,true));
+        ok(!p.automatic(false,false,false));ok(!p.automatic(true,false,false));
+        ok(p.automatic(true,true,false));ok(!p.automatic(true,true,true));
+        ok(!p.automatic(false,true,false));ok(!p.automatic(false,false,true));
+        ok(p.automatic(true,true,false)); // new healthy session can enable again, no checkbox
         PlayerProgressOverlay overlay=new PlayerProgressOverlay();
         overlay.layout(false,false);ok(!overlay.getOverlay()&&overlay.getVisible());
         overlay.layout(true,false);ok(overlay.getOverlay()&&overlay.getVisible());
@@ -34,6 +29,13 @@ public final class PlayerUiCheck {
         PlayerVerticalGesture border=new PlayerVerticalGesture(100,200,300,48,8);ok(border.update(100,0)==null);
         border=new PlayerVerticalGesture(200,200,300,48,8);ok(border.update(200,0).getControl()==VerticalControl.Volume);
         ok(right.update(Double.NaN,0)==null);ok(right.update(0,Double.POSITIVE_INFINITY)==null);
-        System.out.println("PlayerUiCheck: "+count+" assertions passed; initial permission preference and overlay state (no Android/USB)");
+        ProgressMarkers marks=ProgressMarkers.INSTANCE;
+        ok(marks.fraction(0.0,10.0)==0);ok(marks.fraction(10.0,10.0)==1);
+        ok(marks.fraction(2.5,10.0)==0.25);
+        ok(marks.fraction(null,10.0)==null);ok(marks.fraction(1.0,null)==null);
+        ok(marks.fraction(1.0,0.0)==null);ok(marks.fraction(-1.0,10.0)==null);
+        ok(marks.fraction(11.0,10.0)==null);ok(marks.fraction(Double.NaN,10.0)==null);
+        ok(marks.fraction(1.0,Double.POSITIVE_INFINITY)==null);
+        System.out.println("PlayerUiCheck: "+count+" assertions passed; automatic control gates and overlay state (no Android/USB)");
     }
 }
