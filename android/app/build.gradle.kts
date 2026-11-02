@@ -11,8 +11,8 @@ android {
         applicationId = "io.tabletennisreview.usbdiagnostics"
         minSdk = 26
         targetSdk = 37
-        versionCode = 2
-        versionName = "0.2.0-player"
+        versionCode = 9
+        versionName = "0.4.5-vertical-hud"
         ndk { abiFilters += "arm64-v8a" }
     }
     compileOptions {
@@ -39,7 +39,7 @@ val inputCheckRuntime = files(providers.provider {
 })
 val compileInputChecks by tasks.registering(JavaCompile::class) {
     dependsOn("compileDebugKotlin")
-    source("src/testInput/java/TourBoxInputCheck.java", "../../scripts/tests/Config94Check.java", "src/testInput/java/UsbAsyncCleanupCheck.java", "src/testInput/java/UsbGenerationCheck.java")
+    source("src/testInput/java/PlayerUiCheck.java", "src/testInput/java/AutoInitCheck.java", "src/testInput/java/TourBoxPlayerBindingCheck.java", "src/testInput/java/TourBoxInputCheck.java", "../../scripts/tests/Config94Check.java", "src/testInput/java/UsbAsyncCleanupCheck.java", "src/testInput/java/UsbGenerationCheck.java")
     classpath = files(appKotlinClasses) + inputCheckRuntime
     destinationDirectory.set(inputCheckClasses)
     options.encoding = "UTF-8"
@@ -75,3 +75,24 @@ dependencies { implementation(project(":player-mpv")) }
 
 // The standard app check also includes the new pure player contract checks.
 tasks.named("check") { dependsOn(":player-mpv:testPlayer") }
+
+tasks.register<JavaExec>("testTourBoxPlayerBinding") {
+    dependsOn(compileInputChecks)
+    classpath = files(inputCheckClasses, appKotlinClasses) + inputCheckRuntime
+    mainClass.set("TourBoxPlayerBindingCheck")
+}
+tasks.named("check") { dependsOn("testTourBoxPlayerBinding") }
+
+tasks.register<JavaExec>("testAutoInit") {
+    dependsOn(compileInputChecks)
+    classpath = files(inputCheckClasses, appKotlinClasses) + inputCheckRuntime
+    mainClass.set("AutoInitCheck")
+}
+tasks.named("check") { dependsOn("testAutoInit") }
+
+tasks.register<JavaExec>("testPlayerUi") {
+    dependsOn(compileInputChecks)
+    classpath = files(inputCheckClasses, appKotlinClasses) + inputCheckRuntime
+    mainClass.set("PlayerUiCheck")
+}
+tasks.named("check") { dependsOn("testPlayerUi") }

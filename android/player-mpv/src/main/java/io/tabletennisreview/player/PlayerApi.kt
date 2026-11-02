@@ -2,8 +2,14 @@ package io.tabletennisreview.player
 
 /** Discrete controls. No Activity, View, mpv or USB types cross this interface. */
 sealed interface PlayerCommand {
+    data object TogglePaused : PlayerCommand
+    data object CycleSpeed : PlayerCommand
+    data object ToggleLoop : PlayerCommand
     data class SetPaused(val paused: Boolean) : PlayerCommand
     data class SetSpeed(val speed: Double) : PlayerCommand
+    data class SeekAbsolute(val seconds: Double) : PlayerCommand
+    data class ShiftSpeed(val steps: Int) : PlayerCommand
+    data class SeekBySpeed(val direction: Int) : PlayerCommand
     data class SeekRelative(val seconds: Double) : PlayerCommand
     data object StepForward : PlayerCommand
     data object StepBackward : PlayerCommand
@@ -37,6 +43,8 @@ interface PlayerController {
     fun setLogListener(listener: ((String) -> Unit)?)
     fun initialize(contentUri: String): CommandAdmission
     fun execute(command: PlayerCommand): CommandAdmission
+    /** Short authorization, rechecked before each native request; never hold USB locks around native code. */
+    fun executeGuarded(command: PlayerCommand, authorization: () -> Boolean, origin: String): CommandAdmission
     fun pauseForPageChange()
     fun release(reason: String)
     fun close()

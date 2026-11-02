@@ -23,6 +23,43 @@ import io.tabletennisreview.playback.PlayerPanel
 class MainActivity : Activity() {
     private lateinit var playerPanel: PlayerPanel
     private var playerPageVisible = true
+    private var hostActive = false
+    private var fullscreen = false
+    private var fullscreenBack: android.window.OnBackInvokedCallback? = null
+    private var discoveryFailed = false
+    private val autoOpened = mutableSetOf<String>()
+    private val permissionAsked = mutableSetOf<String>()
+    private fun deviceKey(device: UsbDevice) = "${device.deviceName}:${device.deviceId}"
+    private val autoTick = object : Runnable {
+        override fun run() {
+            if (!hostActive || destroyed) return
+            try {
+                val lite = usb.system.deviceList.values.filter { it.vendorId == 0xCAFE && it.productId == 0x4001 }
+                val awaiting = lite.singleOrNull { it.deviceName == pendingPermission && it.deviceId == pendingPermissionId }
+                if (awaiting != null && usb.system.hasPermission(awaiting)) {
+                    cancelPermission()
+                    log("[权限核实] 系统已授权当前请求设备，刷新控制偏好并继续自动连接")
+                }
+                playerPanel.setTourBoxState(lite.size == 1 && usb.system.hasPermission(lite.single()), usb.inputReadySession)
+                playerPanel.setTourBoxStatus("TourBox：${usb.automaticStatus} / ${usb.cleanupStatus}")
+                if (!discoveryFailed && !usb.isListening && usb.connectedName == null && pendingPermission == null) {
+                    if (lite.isEmpty()) playerPanel.setTourBoxStatus("未检测到TourBox Lite；接入后自动连接")
+                    if (lite.size > 1) playerPanel.setTourBoxStatus("检测到多个Lite；请仅保留一台或使用USB诊断手动操作")
+                    if (lite.size == 1) {
+                        val device = lite.single()
+                        val key = deviceKey(device)
+                        if (!usb.system.hasPermission(device)) {
+                            if (permissionAsked.add(key)) requestPermission(device)
+                        } else if (autoOpened.add(key)) {
+                            log("[自动连接] 匹配唯一Lite；force=true双接口与已验证初始化顺序；失败不重试")
+                            usb.startDualListening(device, confirmedForce = true, autoInitialize = true)
+                        }
+                    }
+                }
+            } catch (error: Exception) { discoveryFailed = true; log("[自动连接失败] ${error.javaClass.simpleName}: ${error.message}") }
+            ui.postDelayed(this, 200)
+        }
+    }
     private lateinit var usb: TourBoxUsbManager
     private val diagnostics = DiagnosticLog()
     private val uiLogWriter = java.util.concurrent.Executors.newSingleThreadExecutor { task -> Thread(task, "TourBox-ui-log") }
@@ -63,6 +100,7 @@ class MainActivity : Activity() {
     private var devices = emptyList<UsbDevice>()
     private var selected: UsbDevice? = null
     private var pendingPermission: String? = null
+    private var pendingPermissionId: Int? = null
     private var permissionIntent: PendingIntent? = null
     private var receiversRegistered = false
     private val permissionAction get() = "$packageName.USB_PERMISSION"
@@ -71,15 +109,15 @@ class MainActivity : Activity() {
         override fun onReceive(context: Context, intent: Intent) {
             if (intent.action != permissionAction) return
             val device = intent.usbDevice()
-            if (device == null || device.deviceName != pendingPermission) {
+            if (device == null || device.deviceName != pendingPermission || device.deviceId != pendingPermissionId) {
                 log("忽略过期或无对应请求的 USB 权限回调。")
                 return
             }
-            pendingPermission = null
-            permissionIntent?.cancel()
-            permissionIntent = null
+            cancelPermission()
             val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
             log("权限结果：${device.deviceName}，回调=${if (granted) "允许" else "拒绝"}，当前 hasPermission=${usb.system.hasPermission(device)}")
+            publishTourBoxAvailability()
+            if (hostActive) { ui.removeCallbacks(autoTick); ui.post(autoTick) }
             showSelected()
         }
     }
@@ -88,11 +126,12 @@ class MainActivity : Activity() {
             val device = intent.usbDevice() ?: return
             if (intent.action == UsbManager.ACTION_USB_DEVICE_DETACHED) {
                 log("USB 拔出：${device.deviceName}")
+                autoOpened.remove(deviceKey(device)); permissionAsked.remove(deviceKey(device))
                 usb.detached(device)
                 if (pendingPermission == device.deviceName) cancelPermission()
             } else {
                 usb.attached(device)
-                log("USB 接入：${device.deviceName}；未自动申请权限或连接。")
+                log("USB 接入：${device.deviceName}；前台自动识别Lite并申请系统权限/初始化。")
             }
             refresh()
         }
@@ -103,8 +142,12 @@ class MainActivity : Activity() {
         usb = TourBoxUsbManager(this, ::log) { diagnostics.captureFailure == null && lastExperiment?.isFile == true }
         lastExperiment = File(filesDir, "unlock-experiments").listFiles()?.filter { it.isFile && it.extension == "txt" }?.maxByOrNull { it.lastModified() }
         playerPageVisible = savedInstanceState?.getBoolean("review.playerPage", true) ?: true
+        val version = installedVersion()
+        title = "TableTennis Review $version"
         buildUi()
+        playerPanel.setVersionLabel(version)
         playerPanel.restoreState(savedInstanceState)
+        playerPanel.bindInput(usb.inputEvents)
         // Capture CDC and pre-send failures too, even if the unlock button stays disabled.
         val sessionFile = File(filesDir, "unlock-experiments/diagnostics-${System.currentTimeMillis()}-${System.nanoTime()}.txt")
         if (diagnostics.startCapture(sessionFile)) lastExperiment = sessionFile
@@ -122,9 +165,16 @@ class MainActivity : Activity() {
         }
         receiversRegistered = true
         usb.observing(true)
-        log("诊断启动：保留 IN/CDC 实验；候选八字节仅本连接核实 CDC 返回值后手动二次确认发送一次。")
-        log("后台/旋转会关闭连接；权限结果不会触发自动连接。")
+        log("启动：用户已授权Lite前台自动初始化，A1→A0→8字节→完整26字节→94字节；保留手动诊断。")
+        log("后台关闭连接；返回前台可建立新会话；全屏旋转不重建Activity。首次系统USB权限仍需用户允许。")
     }
+
+    @Suppress("DEPRECATION")
+    private fun installedVersion(): String = runCatching {
+        val info = packageManager.getPackageInfo(packageName, 0)
+        val code = if (Build.VERSION.SDK_INT >= 28) info.longVersionCode else info.versionCode.toLong()
+        "v${info.versionName ?: "未知"}（构建 $code）"
+    }.getOrDefault("版本未知")
 
     private fun buildUi() {
         val root = LinearLayout(this).apply {
@@ -142,8 +192,8 @@ class MainActivity : Activity() {
             insets
         }
         fun text(value: String) = TextView(this).apply { text = value; root.addView(this) }
-        text("TourBox USB Diagnostics · 006Q-B 94字节实验版").textSize = 21f
-        text("选择设备 → 申请权限 → 选择接口（可不选）→ 点击连接")
+        text("$title · USB诊断").textSize = 21f
+        text("Lite前台自动连接初始化；系统权限需允许。以下保留手动诊断；强制占用可能临时断开系统驱动。")
         Button(this).apply { text = "刷新设备"; setOnClickListener { refresh() }; root.addView(this) }
         status = text("未连接")
         text("关键返回值（独立保留，不随 RX 滚动或停止连接清空）")
@@ -320,7 +370,7 @@ class MainActivity : Activity() {
         val host = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         host.setOnApplyWindowInsetsListener { view, insets ->
             @Suppress("DEPRECATION")
-            view.setPadding(insets.systemWindowInsetLeft, insets.systemWindowInsetTop,
+            if (fullscreen) view.setPadding(0, 0, 0, 0) else view.setPadding(insets.systemWindowInsetLeft, insets.systemWindowInsetTop,
                 insets.systemWindowInsetRight, insets.systemWindowInsetBottom)
             insets
         }
@@ -333,6 +383,27 @@ class MainActivity : Activity() {
         }
         tabs.addView(Button(this).apply { text = "播放器"; setOnClickListener { showPlayer(true) } }, LinearLayout.LayoutParams(0, -2, 1f))
         tabs.addView(Button(this).apply { text = "USB诊断"; setOnClickListener { showPlayer(false) } }, LinearLayout.LayoutParams(0, -2, 1f))
+        playerPanel.onFullscreenChanged = { value ->
+            fullscreen = value
+            if (Build.VERSION.SDK_INT >= 33) {
+                if (value) {
+                    val callback = fullscreenBack ?: android.window.OnBackInvokedCallback { playerPanel.exitFullscreen() }.also { fullscreenBack = it }
+                    onBackInvokedDispatcher.registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, callback)
+                } else fullscreenBack?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }
+            }
+            tabs.visibility = if (value) View.GONE else View.VISIBLE
+            requestedOrientation = if (value) android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE else android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            if (Build.VERSION.SDK_INT >= 30) {
+                window.insetsController?.apply {
+                    systemBarsBehavior = android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                    if (value) hide(android.view.WindowInsets.Type.systemBars()) else show(android.view.WindowInsets.Type.systemBars())
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                window.decorView.systemUiVisibility = if (value) View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY else View.SYSTEM_UI_FLAG_VISIBLE
+            }
+            host.requestApplyInsets()
+        }
         host.addView(tabs)
         host.addView(pages, LinearLayout.LayoutParams(-1, 0, 1f))
         showPlayer(playerPageVisible)
@@ -377,16 +448,16 @@ class MainActivity : Activity() {
         startButton.isEnabled = usb.canListen && !usb.isListening
         stopButton.isEnabled = usb.isListening
         dualButton.isEnabled = device != null && hasPermission && !usb.isListening
-        cdcButtons.forEach { it.isEnabled = usb.canCdc }
-        unlockButton.isEnabled = usb.canUnlock
-        configButton.isEnabled = usb.canConfig94
+        cdcButtons.forEach { it.isEnabled = usb.canCdc && !usb.automaticRunning }
+        unlockButton.isEnabled = usb.canUnlock && !usb.automaticRunning
+        configButton.isEnabled = usb.canConfig94 && !usb.automaticRunning
         exportButton.isEnabled = lastExperiment != null && !usb.isListening
         counters.text = getString(R.string.read_counters, usb.totalBytes.get(), usb.readCount.get(), if (usb.isListening) "监听中/正在停止" else "已停止") + "\n" + usb.endpointSummary()
-        status.text = listOf(getString(R.string.connection_status, usb.connectedName ?: "未连接", pendingPermission ?: "无待处理请求"), usb.cleanupStatus, usb.cdcEvidence()).joinToString("\n")
+        status.text = listOf(getString(R.string.connection_status, usb.connectedName ?: "未连接", pendingPermission ?: "无待处理请求"), usb.cleanupStatus, usb.automaticStatus, usb.cdcEvidence()).joinToString("\n")
     }
 
-    private fun requestPermission() {
-        val device = selected ?: return
+    private fun requestPermission(target: UsbDevice? = selected) {
+        val device = target ?: return
         if (usb.system.hasPermission(device)) {
             log("所选设备已授权；仍需点击连接。")
             return
@@ -399,6 +470,7 @@ class MainActivity : Activity() {
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
             permissionIntent = token
             pendingPermission = device.deviceName
+            pendingPermissionId = device.deviceId
             usb.system.requestPermission(device, token)
             log("已请求权限：${device.deviceName}，等待系统结果。")
         } catch (e: Exception) {
@@ -412,6 +484,11 @@ class MainActivity : Activity() {
         permissionIntent?.cancel()
         permissionIntent = null
         pendingPermission = null
+        pendingPermissionId = null
+    }
+    private fun publishTourBoxAvailability() {
+        val lite = usb.system.deviceList.values.filter { it.vendorId == 0xCAFE && it.productId == 0x4001 }
+        playerPanel.setTourBoxState(lite.size == 1 && usb.system.hasPermission(lite.single()), usb.inputReadySession)
     }
     private fun log(message: String) {
         // UI interaction messages must not append files on the main thread.
@@ -431,7 +508,9 @@ class MainActivity : Activity() {
     }
     override fun onStart() {
         super.onStart()
+        hostActive = true; autoOpened.clear(); discoveryFailed = false
         playerPanel.onHostStart()
+        ui.removeCallbacks(autoTick); ui.postDelayed(autoTick, 200)
     }
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putBoolean("review.playerPage", playerPageVisible)
@@ -443,6 +522,7 @@ class MainActivity : Activity() {
         refresh()
     }
     override fun onStop() {
+        hostActive = false; ui.removeCallbacks(autoTick); playerPanel.setTourBoxState(false, null)
         runCatching { playerPanel.onHostStop() }.onFailure { log("播放器后台清理异常：${it.message}") }
         configConfirmation?.dismiss()
         configConfirmation = null
@@ -459,6 +539,7 @@ class MainActivity : Activity() {
         runCatching { playerPanel.close() }.onFailure { log("播放器销毁异常：${it.message}") }
         destroyed = true
         ui.removeCallbacks(render)
+        ui.removeCallbacks(autoTick)
         cancelPermission()
         usb.shutdown()
         uiLogWriter.shutdown()
@@ -468,6 +549,14 @@ class MainActivity : Activity() {
             usb.observing(false)
         }
         super.onDestroy()
+    }
+    // API33+ registers OnBackInvokedCallback only while full screen; this is solely the API26–32 fallback.
+    @android.annotation.SuppressLint("GestureBackNavigation")
+    @Suppress("DEPRECATION")
+    @Deprecated("Legacy back for API 26–32")
+    override fun onBackPressed() {
+        if (Build.VERSION.SDK_INT < 33 && playerPanel.exitFullscreen()) return
+        super.onBackPressed()
     }
     @Suppress("DEPRECATION")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {

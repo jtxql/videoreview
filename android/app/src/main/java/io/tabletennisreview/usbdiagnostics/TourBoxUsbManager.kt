@@ -124,16 +124,43 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit, pri
     private data class UnlockRequest(val epoch: Long, val startCapture: () -> Boolean, val captureHealthy: () -> Boolean)
     private val pendingUnlock = AtomicReference<UnlockRequest?>(null)
     private val config94 = Config94Experiment()
+    @Volatile private var automatic: AutoInitSequence? = null
+    @Volatile private var configuredSession: Long? = null
+    @Volatile private var lastAutomaticStatus = "等待Lite连接"
+    val inputReadySession: Long? get() = configuredSession?.takeIf {
+        it == epoch.get() && cdcReady && !stopRequested && !disposed &&
+            identity?.logicallyDisconnected != true && quarantined == null
+    }
+    val automaticRunning: Boolean get() = automatic?.let { it.session == epoch.get() && it.step != AutoInitStep.Ready && it.step != AutoInitStep.Failed } == true
+    val automaticStatus: String get() = automatic?.let { "自动初始化：${it.step} ${it.failure ?: ""}" } ?: lastAutomaticStatus
+    private fun tickAutomatic(token: Long, session: DualEndpointSession) {
+        val plan = automatic ?: return
+        if (plan.session != token || epoch.get() != token || stopRequested || !session.acceptingControls) return
+        if (!captureHealthy()) plan.fail("日志不可用")
+        val action = plan.next(token, SystemClock.elapsedRealtime(), config94.ready(token))
+        if (plan.step == AutoInitStep.Failed) {
+            log("[自动初始化 FAILED] ${plan.failure}；本会话不重试")
+            stopRequested = true; cdcReady = false; advanceEpoch(); return
+        }
+        when (action) {
+            AutoInitStep.A1 -> queueCdc(CdcAction.A1, fromAutomatic = true)
+            AutoInitStep.A0 -> queueCdc(CdcAction.A0, fromAutomatic = true)
+            AutoInitStep.Init8 -> queueUnlock(token, captureHealthy, captureHealthy, fromAutomatic = true)
+            AutoInitStep.Config94 -> queueConfig94(token, confirmed = true, fromAutomatic = true, healthy = captureHealthy)
+            else -> Unit
+        }
+    }
     private data class ConfigRequest(val epoch: Long, val healthy: () -> Boolean)
     private val pendingConfig = AtomicReference<ConfigRequest?>(null)
     val canConfig94: Boolean get() = cdcReady && !cdcBusy.get() && !stopRequested && !disposed && identity?.logicallyDisconnected != true && quarantined == null && config94.ready(epoch.get())
     fun configToken(): Long? = if (canConfig94) epoch.get() else null
     fun configEvidence() = config94.summary()
-    fun queueConfig94(token: Long, confirmed: Boolean, healthy: () -> Boolean) {
+    fun queueConfig94(token: Long, confirmed: Boolean, fromAutomatic: Boolean = false, healthy: () -> Boolean) {
+        if (automaticRunning && !fromAutomatic) { log("自动初始化中，拒绝混入手动配置"); return }
         if (token != epoch.get() || !canConfig94 || !cdcBusy.compareAndSet(false, true)) return
         if (!config94.reserve(token, confirmed)) { cdcBusy.set(false); return }
         pendingConfig.set(ConfigRequest(token, healthy))
-        log("[配置94] 用户二次确认，本连接机会已消耗，不重试。")
+        log("[配置94] ${if (fromAutomatic) "已授权的自动初始化" else "用户二次确认"}，本连接机会已消耗，不重试。")
     }
     private fun runPendingConfig(sessionEpoch: Long, session: DualEndpointSession) {
         val command = pendingConfig.getAndSet(null) ?: return
@@ -158,8 +185,12 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit, pri
             log("[配置94 END] result=$result expected=94 elapsed=${SystemClock.elapsedRealtime() - before}ms；仅主机侧传输结果，不表示配置生效")
             check(result == 94 && command.healthy()) { "短写/失败/日志故障，不补发" }
             check(epoch.get() == sessionEpoch && session.acceptingControls && system.deviceList[device.deviceName]?.deviceId == device.deviceId && system.hasPermission(device)) { "完成时会话失效" }
+            automatic?.complete(sessionEpoch, AutoInitStep.Config94, result, SystemClock.elapsedRealtime())
+            check(automatic?.step != AutoInitStep.Failed) { "自动初始化结果已失效" }
+            configuredSession = sessionEpoch
             log("[配置94] 保持原始IN观察，本连接不再发送任何初始化。")
         } catch (e: Exception) {
+            automatic?.fail("94字节配置失败:${e.message}")
             log("[配置94 FAILED] ${e.javaClass.simpleName}: ${e.message}；停止，不重试或恢复")
             stopRequested = true; cdcReady = false; advanceEpoch()
         } finally { cdcBusy.set(false) }
@@ -169,14 +200,15 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit, pri
     fun unlockToken(): Long? = if (canUnlock) epoch.get() else null
     fun cdcEvidence() = candidate.summary()
 
-    fun queueUnlock(token: Long, startCapture: () -> Boolean, captureHealthy: () -> Boolean) {
+    fun queueUnlock(token: Long, startCapture: () -> Boolean, captureHealthy: () -> Boolean, fromAutomatic: Boolean = false) {
+        if (automaticRunning && !fromAutomatic) { log("自动初始化中，拒绝混入手动8字节请求"); return }
         if (token != epoch.get() || !canUnlock || !cdcBusy.compareAndSet(false, true)) {
             log("[候选 TX] 未发送：确认已过期，或 CDC 返回值/监听会话不满足条件。")
             return
         }
         if (!candidate.reserve()) { cdcBusy.set(false); return }
         pendingUnlock.set(UnlockRequest(token, startCapture, captureHealthy))
-        log("[候选 TX] 用户二次确认；本连接机会已占用，取消/失败也不会自动补发。")
+        log("[候选 TX] ${if (fromAutomatic) "已授权的自动初始化" else "用户二次确认"}；本连接机会已占用，取消/失败也不会自动补发。")
     }
 
     private fun runPendingUnlock(sessionEpoch: Long, session: DualEndpointSession) {
@@ -206,8 +238,10 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit, pri
             check(result == 8) { "非完整发送 $result，设备可能已收到部分数据" }
             check(command.captureHealthy()) { "实验日志不完整，停止采集" }
             check(epoch.get() == sessionEpoch && session.acceptingControls && system.deviceList[device.deviceName]?.deviceId == device.deviceId && system.hasPermission(device)) { "完成时设备/监听已失效" }
+            automatic?.complete(sessionEpoch, AutoInitStep.Init8, result, SystemClock.elapsedRealtime())
             log("[候选 TX] 继续原始 RX 观察；本连接禁止再发候选或追加 CDC，不解释事件。")
         } catch (e: Exception) {
+            automatic?.fail("8字节初始化失败:${e.message}")
             log("[候选 TX FAILED] ${e.javaClass.simpleName}: ${e.message}；停止实验，不重试、不补发、不恢复。")
             cdcReady = false
             stopRequested = true
@@ -215,13 +249,14 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit, pri
         } finally { cdcBusy.set(false) }
     }
 
-    fun queueCdc(action: CdcAction) {
+    fun queueCdc(action: CdcAction, fromAutomatic: Boolean = false) {
+        if (automaticRunning && !fromAutomatic) { log("自动初始化中，拒绝混入手动CDC"); return }
         if (!canCdc || !cdcBusy.compareAndSet(false, true)) {
             log("[CDC] 未发送：需已授权 Lite 的双接口监听处于有效状态，且没有待执行请求。")
             return
         }
         pendingCdc.set(epoch.get() to action)
-        log("[CDC ${action.name}] 用户手动请求已排队；不会执行其他步骤。")
+        log("[CDC ${action.name}] ${if (fromAutomatic) "自动顺序请求" else "用户手动请求"}已排队。")
     }
 
     private fun runPendingCdc(sessionEpoch: Long, session: DualEndpointSession) {
@@ -244,8 +279,10 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit, pri
             check(epoch.get() == sessionEpoch && session.acceptingControls && system.deviceList[device.deviceName]?.deviceId == device.deviceId && system.hasPermission(device)) { "请求完成时会话/设备已失效" }
             candidate.record(action, result)
             config94.record(action, result)
+            if (action == CdcAction.A1 || action == CdcAction.A0) automatic?.complete(sessionEpoch, if (action == CdcAction.A1) AutoInitStep.A1 else AutoInitStep.A0, result, SystemClock.elapsedRealtime())
             log("[CDC 返回核实] ${candidate.summary()}")
         } catch (e: Exception) {
+            automatic?.fail("CDC失败:${e.message}")
             log("[CDC ${action.name} FAILED] ${e.javaClass.simpleName}: ${e.message}；停止本轮，不自动重试或恢复。")
             cdcReady = false
             stopRequested = true
@@ -456,7 +493,7 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit, pri
         if (readerActive.get()) log("已请求停止；等待当前有限超时读取返回，期间不关闭连接。")
     }
 
-    fun startDualListening(device: UsbDevice, confirmedForce: Boolean) {
+    fun startDualListening(device: UsbDevice, confirmedForce: Boolean, autoInitialize: Boolean = false) {
         if (disposed || !confirmedForce) return
         if (!readerActive.compareAndSet(false, true)) { log("请先停止现有读取任务，再启动双接口模式。"); return }
         identity?.let { generations.stopping(it, true) }
@@ -466,7 +503,8 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit, pri
         worker.execute {
             try {
                 if (quarantined != null) { log("隔离状态，拒绝双端点测试。"); return@execute }
-                closeInternal("切换到明确确认的双接口只读实验")
+                closeInternal("切换到双接口会话")
+                lastAutomaticStatus = if (autoInitialize) "自动连接/占用接口中" else "手动诊断模式"
                 if (epoch.get() != request || disposed) return@execute
                 val current = system.deviceList[device.deviceName]
                 require(current != null && current.deviceId == device.deviceId && current.vendorId == 0xCAFE && current.productId == 0x4001 && system.hasPermission(current)) { "Lite 不在列表或未授权" }
@@ -494,6 +532,7 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit, pri
                 if (epoch.get() != request) return@execute
                 stopRequested = false
                 input.begin(request)
+                automatic = if (autoInitialize) AutoInitSequence(request) else null
                 val sessionKey = identity ?: error("连接身份丢失")
                 val session = DualEndpointSession(opened, ep81, ep82, controlStats, dataStats,
                     { stopRequested || epoch.get() != request || sessionKey.logicallyDisconnected },
@@ -519,17 +558,19 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit, pri
                         advanceEpoch()
                     })
                 session.onCoordinatorTick = {
+                    tickAutomatic(request, session)
                     runPendingCdc(request, session)
                     runPendingUnlock(request, session)
                     runPendingConfig(request, session)
                 }
                 cdcReady = true
-                log("[CDC] 双接口已占用，A1/A2/A3 可分别手动触发；不会自动初始化。")
+                log("[CDC] 双接口已占用；${if (autoInitialize) "按用户授权自动执行A1→A0→8字节→核实26字节→94字节" else "手动诊断，不自动初始化"}。")
                 asyncResources = session.run()
                 // run returns only after both readers AND the last control action finish.
                 connectedName = null
                 cleanupStatus = "已逻辑断开；等待回收结果"
             } catch (e: Exception) {
+                lastAutomaticStatus = "连接失败：${e.javaClass.simpleName}: ${e.message}"
                 log("双接口实验异常：${e.javaClass.simpleName}: ${e.message}")
             } finally {
                 closeInternal("双端点会话结束，读取任务已退出")
@@ -541,6 +582,8 @@ class TourBoxUsbManager(context: Context, private val log: (String) -> Unit, pri
 
     private fun closeInternal(reason: String) {
         input.end()
+        automatic?.let { lastAutomaticStatus = if (it.step == AutoInitStep.Failed) "初始化失败：${it.failure}" else "已断开；上次初始化阶段=${it.step}" }
+        automatic = null; configuredSession = null
         cdcReady = false
         candidate.reset()
         config94.reset()

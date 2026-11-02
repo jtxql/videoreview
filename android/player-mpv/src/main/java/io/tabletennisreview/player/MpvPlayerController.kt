@@ -135,33 +135,52 @@ internal class MpvPlayerController(private val video: MpvView) : PlayerControlle
         }
     }
 
-    override fun execute(command: PlayerCommand): CommandAdmission {
+    override fun execute(command: PlayerCommand): CommandAdmission = executeGuarded(command, { true }, "screen")
+
+    override fun executeGuarded(command: PlayerCommand, authorization: () -> Boolean, origin: String): CommandAdmission {
         mainOnly()
         val player = core ?: return CommandAdmission.Rejected("请先初始化视频")
         val jobs = scope ?: return CommandAdmission.Rejected("播放器尚未就绪")
         val token = state.sessionId
         if (closed || !epoch.isCurrent(token) || !state.loaded || state.busy) return CommandAdmission.Rejected("播放器未加载或操作进行中")
-        if (PlayerPolicy.needsSeek(command) && !state.seekable) return CommandAdmission.Rejected("该文件未报告可seek")
+        val admissionCommand = if (command == PlayerCommand.ToggleLoop) PlayerPolicy.toggleLoop(state.loop) else command
+        if (PlayerPolicy.needsSeek(admissionCommand) && !state.seekable) return CommandAdmission.Rejected("该文件未报告可seek")
+        if (!runCatching { authorization() }.getOrDefault(false)) return CommandAdmission.Rejected("控制来源已失效")
         val oldLoop = state.loop
         val id = ++op
         emit(state.copy(busy = true))
-        log("CONTROL BEGIN session=$token op=$id command=$command")
+        log("CONTROL BEGIN session=$token op=$id command=$command origin=$origin")
         jobs.launch {
             try {
-                if (!epoch.isCurrent(token)) return@launch
+                fun authorized() {
+                    if (!epoch.isCurrent(token) || core !== player || !runCatching { authorization() }.getOrDefault(false))
+                        throw CancellationException("控制来源或播放器会话已失效")
+                }
+                authorized()
                 log("CONTROL BEFORE session=$token op=$id ${snapshot(player)}")
                 val changed = withTimeout(15_000) {
-                    val loop = when (command) {
+                    currentCoroutineContext().ensureActive(); authorized()
+                    val effective = when (command) {
+                        PlayerCommand.TogglePaused -> PlayerPolicy.toggled(player.getAsync(MpvProperties.Pause).getOrThrow())
+                        PlayerCommand.CycleSpeed -> PlayerPolicy.nextSpeed(player.getAsync(MpvProperties.Speed).getOrThrow())
+                        PlayerCommand.ToggleLoop -> PlayerPolicy.toggleLoop(oldLoop)
+                        is PlayerCommand.ShiftSpeed -> PlayerPolicy.shiftSpeed(command.steps, player.getAsync(MpvProperties.Speed).getOrThrow())
+                        is PlayerCommand.SeekBySpeed -> PlayerPolicy.speedSeek(command.direction, player.getAsync(MpvProperties.Speed).getOrThrow())
+                        else -> command
+                    }
+                    currentCoroutineContext().ensureActive(); authorized()
+                    log("CONTROL RESOLVED session=$token op=$id command=$effective origin=$origin")
+                    val loop = when (effective) {
                         PlayerCommand.MarkA -> oldLoop.markA(player.getAsync(MpvProperties.TimePos).getOrThrow())
                         PlayerCommand.MarkB -> oldLoop.markB(player.getAsync(MpvProperties.TimePos).getOrThrow())
                         PlayerCommand.EnableLoop -> oldLoop.enabled(player.getAsync(MpvProperties.Duration).getOrNull())
                         PlayerCommand.ClearLoop -> LoopPoints()
                         else -> oldLoop
                     }
-                    val requests = PlayerPolicy.requests(command, loop)
+                    val requests = PlayerPolicy.requests(effective, loop)
                     for (request in requests) {
                         currentCoroutineContext().ensureActive()
-                        check(epoch.isCurrent(token) && core === player) { "旧播放器会话" }
+                        authorized()
                         when (request) {
                             is NativeRequest.Property -> player.setString(request.name, request.value).getOrThrow()
                             is NativeRequest.Command -> player.commandAsync(MpvCommand.of(*request.arguments.toTypedArray())).getOrThrow()
@@ -171,12 +190,12 @@ internal class MpvPlayerController(private val video: MpvView) : PlayerControlle
                 }
                 log("CONTROL RESULT session=$token op=$id accepted-by-core; ${snapshot(player)}")
                 main.post { if (epoch.isCurrent(token)) emit(state.copy(loop = changed, message = "操作已执行；以画面及状态为准")) }
-                delay(250)
-                if (epoch.isCurrent(token)) log("CONTROL OBSERVED session=$token op=$id ${snapshot(player)}")
+                // Native completion/result above owns serialization; no fixed post-command delay.
+                // The independent 250ms display observer remains unchanged.
             } catch (timeout: TimeoutCancellationException) {
                 main.post { fail(token, "control-timeout", timeout) }
             } catch (cancelled: CancellationException) {
-                log("CONTROL CANCEL session=$token op=$id; no retry"); throw cancelled
+                log("CONTROL CANCEL session=$token op=$id origin=$origin; no retry"); throw cancelled
             } catch (invalid: IllegalArgumentException) {
                 main.post { if (epoch.isCurrent(token)) { log("CONTROL REJECT session=$token op=$id ${invalid.message}"); emit(state.copy(message = invalid.message ?: "参数无效")) } }
             } catch (error: Throwable) {
