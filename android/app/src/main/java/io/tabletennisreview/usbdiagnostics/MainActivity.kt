@@ -18,8 +18,11 @@ import android.content.ClipboardManager
 import android.view.View
 import android.widget.*
 import java.io.File
+import io.tabletennisreview.playback.PlayerPanel
 
 class MainActivity : Activity() {
+    private lateinit var playerPanel: PlayerPanel
+    private var playerPageVisible = true
     private lateinit var usb: TourBoxUsbManager
     private val diagnostics = DiagnosticLog()
     private val uiLogWriter = java.util.concurrent.Executors.newSingleThreadExecutor { task -> Thread(task, "TourBox-ui-log") }
@@ -99,7 +102,9 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         usb = TourBoxUsbManager(this, ::log) { diagnostics.captureFailure == null && lastExperiment?.isFile == true }
         lastExperiment = File(filesDir, "unlock-experiments").listFiles()?.filter { it.isFile && it.extension == "txt" }?.maxByOrNull { it.lastModified() }
+        playerPageVisible = savedInstanceState?.getBoolean("review.playerPage", true) ?: true
         buildUi()
+        playerPanel.restoreState(savedInstanceState)
         // Capture CDC and pre-send failures too, even if the unlock button stays disabled.
         val sessionFile = File(filesDir, "unlock-experiments/diagnostics-${System.currentTimeMillis()}-${System.nanoTime()}.txt")
         if (diagnostics.startCapture(sessionFile)) lastExperiment = sessionFile
@@ -306,7 +311,32 @@ class MainActivity : Activity() {
         text("诊断日志（最近 200 条）")
         logView = TextView(this).apply { textSize = 12f; setTextIsSelectable(true) }
         root.addView(ScrollView(this).apply { addView(logView) }, LinearLayout.LayoutParams(-1, panelHeight))
-        setContentView(ScrollView(this).apply { isFillViewport = true; addView(root) })
+        val diagnosticsPage = ScrollView(this).apply { isFillViewport = true; addView(root) }
+        playerPanel = PlayerPanel(this)
+        val pages = FrameLayout(this).apply {
+            addView(diagnosticsPage, FrameLayout.LayoutParams(-1, -1))
+            addView(playerPanel, FrameLayout.LayoutParams(-1, -1))
+        }
+        val host = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        host.setOnApplyWindowInsetsListener { view, insets ->
+            @Suppress("DEPRECATION")
+            view.setPadding(insets.systemWindowInsetLeft, insets.systemWindowInsetTop,
+                insets.systemWindowInsetRight, insets.systemWindowInsetBottom)
+            insets
+        }
+        val tabs = LinearLayout(this)
+        fun showPlayer(show: Boolean) {
+            playerPanel.setPageVisible(show)
+            playerPageVisible = show
+            playerPanel.visibility = if (show) View.VISIBLE else View.GONE
+            diagnosticsPage.visibility = if (show) View.GONE else View.VISIBLE
+        }
+        tabs.addView(Button(this).apply { text = "播放器"; setOnClickListener { showPlayer(true) } }, LinearLayout.LayoutParams(0, -2, 1f))
+        tabs.addView(Button(this).apply { text = "USB诊断"; setOnClickListener { showPlayer(false) } }, LinearLayout.LayoutParams(0, -2, 1f))
+        host.addView(tabs)
+        host.addView(pages, LinearLayout.LayoutParams(-1, 0, 1f))
+        showPlayer(playerPageVisible)
+        setContentView(host)
     }
 
     private fun refresh() {
@@ -399,11 +429,21 @@ class MainActivity : Activity() {
         // One pending UI update, not one Runnable per received packet.
         if (!destroyed && renderQueued.compareAndSet(false, true)) ui.postDelayed(render, 100)
     }
+    override fun onStart() {
+        super.onStart()
+        playerPanel.onHostStart()
+    }
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("review.playerPage", playerPageVisible)
+        playerPanel.saveState(outState)
+        super.onSaveInstanceState(outState)
+    }
     override fun onResume() {
         super.onResume()
         refresh()
     }
     override fun onStop() {
+        runCatching { playerPanel.onHostStop() }.onFailure { log("播放器后台清理异常：${it.message}") }
         configConfirmation?.dismiss()
         configConfirmation = null
         unlockConfirmation?.dismiss()
@@ -416,6 +456,7 @@ class MainActivity : Activity() {
         super.onStop()
     }
     override fun onDestroy() {
+        runCatching { playerPanel.close() }.onFailure { log("播放器销毁异常：${it.message}") }
         destroyed = true
         ui.removeCallbacks(render)
         cancelPermission()
@@ -431,6 +472,7 @@ class MainActivity : Activity() {
     @Suppress("DEPRECATION")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (playerPanel.onActivityResult(requestCode, resultCode, data)) return
         if (requestCode != 702 || resultCode != RESULT_OK) return
         val uri = data?.data ?: return
         val source = exportFile ?: return

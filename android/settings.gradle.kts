@@ -10,7 +10,10 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        maven("https://yuroyami.github.io/maven") {
+            content { includeGroup("io.github.yuroyami") }
+        }
     }
 }
 rootProject.name = "TourBoxUsbDiagnostics"
-include(":app")
+include(":app", ":player-mpv")

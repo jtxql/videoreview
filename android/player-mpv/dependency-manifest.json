@@ -1,0 +1,17 @@
+{
+  "component": "io.github.yuroyami:libmpvkt-view:0.3.0",
+  "source_commit": "b001dd97538e7d3e700df80029fd72be99ceba3f",
+  "repository": "https://yuroyami.github.io/maven/",
+  "abi": "arm64-v8a",
+  "native_versions_publisher_declared": {
+    "mpv": "0.41.0",
+    "ffmpeg": "9.0.1",
+    "ndk": "29.0.14206865"
+  },
+  "aar_sha256_previously_independently_verified": {
+    "libmpvkt-native-android:0.3.0": "400173ab543f396934966dc9ad3fa6af1cd204f0b0de054593a6b3218fc12b50",
+    "libmpvkt-android:0.3.0": "16f535429f914ebd248da16e0271280ddf96506ea9c77e221ae3a2cefef1686c",
+    "libmpvkt-view-android:0.3.0": "3c3839fe05a210010bf539bca9db612b8a4a194fb4c0faeb48d94f742c9b37f7"
+  },
+  "licensing": "Wrapper Apache-2.0; packaged native combination GPL-3.0-or-later per publisher NOTICE; source/redistribution audit remains required before external release"
+}

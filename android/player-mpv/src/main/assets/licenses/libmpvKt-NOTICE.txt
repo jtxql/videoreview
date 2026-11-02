@@ -1,0 +1,62 @@
+libmpvKt
+Copyright 2026 Yuroyami
+
+The Kotlin wrapper, the JNI sources and the build scripts in this repository are
+licensed under the Apache License, Version 2.0. See LICENSE.
+
+--------------------------------------------------------------------------------
+mpv-android
+--------------------------------------------------------------------------------
+
+MPVLib.kt, the JNI sources under libmpvkt-native/native/jni and the shape of the
+build scripts under buildscripts/ derive from mpv-android
+(https://github.com/mpv-android/mpv-android), which is licensed under the MIT
+License:
+
+  Copyright (c) 2016 mpv-android contributors
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+
+--------------------------------------------------------------------------------
+The native libraries inside the published AAR
+--------------------------------------------------------------------------------
+
+The AAR redistributes compiled copies of the projects below, built from
+unmodified release sources at the tags named in buildscripts/include/depinfo.sh.
+They are NOT covered by libmpvKt's Apache-2.0 licence. Because mpv is GPL and
+FFmpeg is configured with --enable-gpl --enable-version3, the AAR as a whole can
+only be redistributed under the GNU General Public License, version 3 or later.
+An application that ships it is bound by that licence.
+
+  mpv           GPL-2.0-or-later      https://mpv.io
+  FFmpeg        GPL-3.0-or-later      https://ffmpeg.org  (as configured; LGPL by default)
+  libass        ISC                   https://github.com/libass/libass
+  libplacebo    LGPL-2.1-or-later     https://code.videolan.org/videolan/libplacebo
+  dav1d         BSD-2-Clause          https://code.videolan.org/videolan/dav1d
+  Mbed TLS      Apache-2.0            https://github.com/Mbed-TLS/mbedtls
+  HarfBuzz      MIT                   https://github.com/harfbuzz/harfbuzz
+  FreeType      FTL                   https://freetype.org
+  FriBidi       LGPL-2.1-or-later     https://github.com/fribidi/fribidi
+  libunibreak   zlib                  https://github.com/adah1972/libunibreak
+  Lua           MIT                   https://www.lua.org
+  libc++        Apache-2.0 with LLVM exception, from the Android NDK
+
+The complete corresponding source of mpv and FFmpeg is attached to every
+libmpvKt GitHub release beside the binaries, and every other project is
+reachable at the tag named in BUILD-INFO.txt inside each release zip.
