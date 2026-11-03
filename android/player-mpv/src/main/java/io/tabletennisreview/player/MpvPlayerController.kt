@@ -32,7 +32,9 @@ internal class MpvPlayerController(private val video: MpvView) : PlayerControlle
     override fun setStateListener(listener: ((PlayerState) -> Unit)?) { mainOnly(); stateListener = listener; listener?.invoke(state) }
     override fun setLogListener(listener: ((String) -> Unit)?) { mainOnly(); logListener = listener }
 
-    override fun initialize(contentUri: String): CommandAdmission {
+    override fun initialize(contentUri: String): CommandAdmission = initializeInternal(contentUri, false)
+    override fun initializePaused(contentUri: String): CommandAdmission = initializeInternal(contentUri, true)
+    private fun initializeInternal(contentUri: String, paused: Boolean): CommandAdmission {
         mainOnly()
         if (closed || preparing) return CommandAdmission.Rejected("播放器已关闭或仍在初始化")
         if (!contentUri.startsWith("content://")) return CommandAdmission.Rejected("仅接受系统授权的content文档")
@@ -40,7 +42,7 @@ internal class MpvPlayerController(private val video: MpvView) : PlayerControlle
         val token = epoch.begin()
         preparing = true
         emit(PlayerState(sessionId = token, phase = PlayerPhase.Initializing, busy = true, message = "后台初始化中"))
-        val options = MpvOptions(displayFps = video.display?.refreshRate?.toDouble(), extra = mapOf("pause" to "yes", "tls-verify" to "yes", "loop-file" to "inf"))
+        val options = MpvOptions(displayFps = video.display?.refreshRate?.toDouble(), extra = mapOf("pause" to if (paused) "yes" else "no", "tls-verify" to "yes", "loop-file" to "inf"))
         val app = video.context.applicationContext
         log("INIT BEGIN session=$token; using built-in content protocol; loop-file=inf")
         starter.execute {
@@ -204,6 +206,112 @@ internal class MpvPlayerController(private val video: MpvView) : PlayerControlle
                 main.post { if (epoch.isCurrent(token)) emit(state.copy(busy = false)) }
             }
         }
+        return CommandAdmission.Accepted
+    }
+
+    override fun prepareScreenshot(callback: (ScreenshotPreparation) -> Unit): CommandAdmission = prepareScreenshotGuarded({ true },callback)
+    override fun prepareScreenshotGuarded(authorization: () -> Boolean, callback: (ScreenshotPreparation) -> Unit): CommandAdmission {
+        mainOnly()
+        val player = core ?: return CommandAdmission.Rejected("请先加载视频")
+        val jobs = scope ?: return CommandAdmission.Rejected("播放器未就绪")
+        val token = state.sessionId
+        if (closed || !epoch.isCurrent(token) || !state.loaded || state.busy) return CommandAdmission.Rejected("播放器尚未就绪或仍在操作")
+        if (!runCatching { authorization() }.getOrDefault(false)) return CommandAdmission.Rejected("截图控制来源已失效")
+        emit(state.copy(busy = true))
+        jobs.launch {
+            val result = try {
+                withTimeout(5_000) {
+                    requireExportSourceCurrent(token, player)
+                    check(runCatching { authorization() }.getOrDefault(false)) { "截图控制来源已失效" }
+                    player.setString("pause", "yes").getOrThrow()
+                    currentCoroutineContext().ensureActive(); requireExportSourceCurrent(token, player)
+                    check(player.getAsync(MpvProperties.Pause).getOrThrow()) { "暂停未得到核心确认" }
+                    check(runCatching { authorization() }.getOrDefault(false)) { "截图控制来源已失效" }
+                    ScreenshotPreparation.Ready(token)
+                }
+            } catch (e: Exception) { ScreenshotPreparation.Rejected("暂停截图失败：${e.message}") }
+            main.post {
+                val current = !closed && epoch.isCurrent(token) && core === player
+                if (current) emit(state.copy(busy = false))
+                log("SCREENSHOT PAUSE session=$token result=$result current=$current")
+                callback(if (current) result else ScreenshotPreparation.Rejected("截图来源会话已失效"))
+            }
+        }
+        return CommandAdmission.Accepted
+    }
+
+    override fun prepareReviewSnapshot(authorization: () -> Boolean, callback: (ReviewPreparation) -> Unit): CommandAdmission =
+        runReview(null,authorization,callback)
+
+    override fun restoreReview(preset: ReviewPreset, authorization: () -> Boolean, callback: (ReviewRestoreResult) -> Unit): CommandAdmission =
+        runReview(preset,authorization) { result -> callback(when(result) {
+            is ReviewPreparation.Ready -> ReviewRestoreResult.Ready(result.snapshot.sessionId)
+            is ReviewPreparation.Rejected -> ReviewRestoreResult.Rejected(result.reason)
+        }) }
+
+    /** Single busy owner, including delivery after cancellation before the coroutine starts. */
+    private fun runReview(preset: ReviewPreset?, authorization: () -> Boolean, callback: (ReviewPreparation) -> Unit): CommandAdmission {
+        mainOnly()
+        val player = core ?: return CommandAdmission.Rejected("请先加载视频")
+        val jobs = scope ?: return CommandAdmission.Rejected("播放器尚未就绪")
+        val token = state.sessionId
+        if (closed || !epoch.isCurrent(token) || !state.loaded || state.busy || !state.seekable ||
+            !runCatching { authorization() }.getOrDefault(false)) return CommandAdmission.Rejected("书签来源失效或播放器尚未空闲")
+        val points = state.loop
+        if (preset == null && (points.a == null || points.b == null)) return CommandAdmission.Rejected("请先标记有效A/B")
+        emit(state.copy(busy = true))
+        log("REVIEW BEGIN session=$token mode=${if (preset == null) "snapshot" else "restore"}")
+        val result = java.util.concurrent.atomic.AtomicReference<ReviewPreparation?>()
+        val job = jobs.launch {
+            var touched = false
+            try {
+                result.set(withTimeout(15_000) {
+                    val operationContext = currentCoroutineContext()
+                    fun valid() {
+                        operationContext.ensureActive()
+                        if (!epoch.isCurrent(token) || core !== player || !runCatching { authorization() }.getOrDefault(false))
+                            throw CancellationException("书签来源会话已失效")
+                    }
+                    valid()
+                    if (preset == null) {
+                        player.setString("pause","yes").getOrThrow(); valid()
+                        val speed = player.getAsync(MpvProperties.Speed).getOrThrow(); valid()
+                        val duration = player.getAsync(MpvProperties.Duration).getOrThrow(); valid()
+                        val saved = ReviewPreset(checkNotNull(points.a),checkNotNull(points.b),speed)
+                        saved.validated(duration)
+                        ReviewPreparation.Ready(ReviewSnapshot(token,saved,duration))
+                    } else {
+                        val duration = player.getAsync(MpvProperties.Duration).getOrThrow(); valid()
+                        val requests = ReviewRestorePlan.requests(preset,duration)
+                        for (request in requests) {
+                            valid(); touched = true
+                            when(request) {
+                                is NativeRequest.Property -> player.setString(request.name,request.value).getOrThrow()
+                                is NativeRequest.Command -> player.commandAsync(MpvCommand.of(*request.arguments.toTypedArray())).getOrThrow()
+                            }
+                        }
+                        valid(); ReviewPreparation.Ready(ReviewSnapshot(token,preset,duration))
+                    }
+                })
+            } catch (error: Exception) {
+                result.set(ReviewPreparation.Rejected("书签${if (preset == null) "快照" else "恢复"}未完成：${error.javaClass.simpleName}"))
+                if (touched) main.post { fail(token,"review-restore",error) }
+            }
+        }
+        job.invokeOnCompletion { cause -> main.post {
+            val current = !closed && epoch.isCurrent(token) && core === player
+            val value = result.get()
+            val delivered = if (cause == null && current && runCatching { authorization() }.getOrDefault(false) && value != null) value
+                else ReviewPreparation.Rejected("书签来源已失效或操作取消")
+            if (current) {
+                val ready = delivered as? ReviewPreparation.Ready
+                emit(if (ready != null && preset != null) state.copy(busy = false,loop = preset.validated(ready.snapshot.duration),
+                    speed = preset.speed,phase = PlayerPhase.Playing,message = "已恢复片段书签")
+                    else state.copy(busy = false,phase = if (ready != null) PlayerPhase.Paused else state.phase))
+            }
+            log("REVIEW END session=$token mode=${if (preset == null) "snapshot" else "restore"} ready=${delivered is ReviewPreparation.Ready}")
+            callback(delivered)
+        } }
         return CommandAdmission.Accepted
     }
 

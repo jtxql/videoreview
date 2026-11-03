@@ -9,6 +9,8 @@ import io.github.yuroyami.libmpvkt.view.MpvView
 class ReviewPlayerView @JvmOverloads constructor(context: Context, attrs: AttributeSet? = null) : FrameLayout(context, attrs) {
     private val video = MpvView(context)
     val controller: PlayerController = MpvPlayerController(video)
+    /** Only the actual rendering layer, never application overlays. Unknown layouts fail closed. */
+    fun captureLayer(): android.view.View? = if (video.childCount == 1) video.getChildAt(0) else null
     val viewport = VideoViewport()
     var onViewportChanged: (() -> Unit)? = null
     init { clipChildren = true; clipToPadding = true; addView(video, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)) }

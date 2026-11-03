@@ -3,8 +3,6 @@ package io.tabletennisreview.playback
 import android.app.Activity
 import android.app.AlertDialog
 import io.tabletennisreview.export.*
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Intent
 import android.net.Uri
 import android.media.AudioManager
@@ -24,12 +22,11 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.*
 import io.tabletennisreview.player.*
-import java.util.ArrayDeque
 import java.util.Locale
 
 /** Host UI only. It has no USB or mpv import and never initializes a controller device. */
 class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
-    companion object { private const val PICK = 8101; private const val EXPORT = 8102; private const val SAVE_CLIP = 8103 }
+    companion object { private const val PICK = 8101; private const val SAVE_CLIP = 8103 }
     private val journal = PlayerLog(activity.applicationContext)
     private val clipExporter = ClipExporter(activity.applicationContext, ::onClipState)
     private val clipStatus = TextView(activity).apply { textSize = 12f }
@@ -43,14 +40,27 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
     private var lastClipLog: ClipExportState? = null
     private val clipHolding: Boolean get() = clipPreparing || clipConfirmation != null || clipExporter.state.phase in
         listOf(ClipExportPhase.Preparing, ClipExportPhase.Exporting, ClipExportPhase.Ready, ClipExportPhase.Saving)
-    private val recent = ArrayDeque<String>()
     private val video = ReviewPlayerView(activity)
     private val controller = video.controller
+    private val shotGate = ShotSessionGate()
+    private val shotCapture = ViewportCapture(video)
+    private var shotEditor: ScreenshotEditor? = null
+    private var shotSourceSession = 0L
+    private var reloadPaused = false
+    private val shotHolding: Boolean get() = shotGate.phase != ShotPhase.Idle || shotEditor != null
+    private val bookmarkStore = ClipBookmarkStore.get(activity.applicationContext)
+    private var bookmarkLease: ClipBookmarkSession? = null
+    private var bookmarkDialog: ClipBookmarkDialog? = null
+    private val bookmarkHolding: Boolean get() = bookmarkLease != null
+    private val bookmarkEntry: Button
+    private val floatingBookmark = Button(activity).apply { text = "片段书签"; textSize = 12f; visibility = View.GONE }
+    private val controlHolding: Boolean get() = clipHolding || shotHolding || bookmarkHolding
+    private val settingsEntry: Button
+    private val screenshotEntry: Button
+    private val floatingShot = Button(activity).apply { text = "截图"; textSize = 12f; visibility = View.GONE }
     private var binding: TourBoxPlayerBinding? = null
     var onFullscreenChanged: (Boolean) -> Unit = {}
-    var onDiagnosticsRequested: () -> Unit = {}
-    private val diagnosticContent = LinearLayout(activity).apply { orientation = VERTICAL }
-    fun diagnosticsView(): View = diagnosticContent
+    var onSettingsRequested: () -> Unit = {}
     private var fullscreen = false
     private val fullSwitch = CheckBox(activity).apply { text = "全屏" }
     private val progress = AbMarkedSeekBar(activity).apply { max = PlayerInteractionPolicy.PROGRESS_MAX }
@@ -87,20 +97,12 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
     private var scrubbing = false
     private var pendingAutoLoad = false
     private var choosingDocument = false
-    private val tourBoxStatus = TextView(activity).apply { textSize = 12f }
     private var usbSession: Long? = null
     private var usbAuthorized = false
     private val controlsScroll: ScrollView
-    private val logScroll: ScrollView
-    private val title: TextView
     private val touchOverlay: View
-    private val mappingStatus = TextView(activity).apply { textSize = 12f }
-    private val status = TextView(activity)
-    private val loopStatus = TextView(activity)
-    private val logView = TextView(activity).apply { textSize = 11f; setTextIsSelectable(true) }
-    private val initialize: Button
     private val choose: Button
-    private val release: Button
+    private val playPause: Button
     private val actions = mutableListOf<Button>()
     private var selected: Uri? = null
     private var foreground = false
@@ -110,9 +112,6 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
     init {
         orientation = VERTICAL
         setPadding(12, 8, 12, 8)
-        title = TextView(activity).apply { text = "TableTennis Review · 本地复盘"; textSize = 18f }
-        diagnosticContent.addView(title)
-        diagnosticContent.addView(status); diagnosticContent.addView(loopStatus)
         addView(video, LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         val progressHeader = LinearLayout(activity).apply { gravity = android.view.Gravity.CENTER_VERTICAL }
         progressHeader.addView(progressLabel, LayoutParams(-2, -2))
@@ -189,19 +188,10 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
         }
         val tools = row()
         tools.addView(fullSwitch, LayoutParams(0, compactButtonHeight(), 1f))
-        val file = row()
-        choose = button(file, "选择视频") { pick() }
-        initialize = button(file, "重新载入") {
-            val uri = selected
-            pendingAutoLoad = false
-            suspendMapping()
-            if (uri != null) admission(controller.initialize(uri.toString()))
-        }
-        release = button(file, "释放") { pendingAutoLoad = false; suspendMapping(); controller.release("用户释放") }
-        diagnosticContent.addView(tourBoxStatus); diagnosticContent.addView(mappingStatus)
+        choose = button(tools, "选择视频") { pick() }
         val playback = row()
-        command(playback, "播放", PlayerCommand.SetPaused(false))
-        command(playback, "暂停", PlayerCommand.SetPaused(true))
+        playPause = button(playback, "播放") { submit(PlayerCommand.TogglePaused) }
+        actions += playPause
         command(playback, "快退5秒", PlayerCommand.SeekRelative(-5.0))
         command(playback, "快进5秒", PlayerCommand.SeekRelative(5.0))
         val frames = row()
@@ -220,33 +210,38 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
         controls.addView(clipStatus)
         clipStatus.text = "标记A/B后可按当前倍速导出；生成后需另存"
         clipStatus.visibility = View.GONE
-        button(row(), "USB诊断") { onDiagnosticsRequested() }
-        val logs = LinearLayout(activity).also { diagnosticContent.addView(it) }
-        button(logs, "添加标记") { record("MARK session=${controller.state.sessionId} ${controller.state}") }
-        button(logs, "复制摘要") {
-            (activity.getSystemService(Activity.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("播放器日志摘要", recent.joinToString("\n")))
-            record("复制最近100条摘要；完整记录请导出")
-        }
-        button(logs, "导出播放器日志") { export() }
-        logScroll = ScrollView(activity).apply { addView(logView) }
-        diagnosticContent.addView(logScroll, LayoutParams(-1, (160 * resources.displayMetrics.density).toInt()))
+        val extras = row()
+        screenshotEntry = button(extras, "截图标注") { takeScreenshot() }
+        bookmarkEntry = button(extras, "片段书签") { openBookmarks() }
+        settingsEntry = button(extras, "TourBox设置") { if (SettingsUiPolicy.canOpen(controller.state.phase,controller.state.busy,controlHolding)) onSettingsRequested() }
+        floatingShot.setOnClickListener { takeScreenshot() }
+        video.addView(floatingShot, FrameLayout.LayoutParams((72 * resources.displayMetrics.density).toInt(),
+            (40 * resources.displayMetrics.density).toInt(), android.view.Gravity.END or android.view.Gravity.BOTTOM).apply {
+            rightMargin = (8 * resources.displayMetrics.density).toInt(); bottomMargin = (84 * resources.displayMetrics.density).toInt()
+        })
+        floatingBookmark.setOnClickListener { openBookmarks() }
+        video.addView(floatingBookmark,FrameLayout.LayoutParams((88 * resources.displayMetrics.density).toInt(),
+            (40 * resources.displayMetrics.density).toInt(),android.view.Gravity.END or android.view.Gravity.BOTTOM).apply {
+            rightMargin = (88 * resources.displayMetrics.density).toInt(); bottomMargin = (84 * resources.displayMetrics.density).toInt()
+        })
         updateProgressLayout()
         controller.setLogListener(::record)
         controller.setStateListener { value ->
+            if (bookmarkLease?.let { it.source.playerSession != value.sessionId || !value.loaded } == true) cancelBookmarks("播放器会话变化")
+            bookmarkDialog?.setPlayerState(value)
+            if (shotGate.phase == ShotPhase.Capturing && value.sessionId != shotSourceSession) abortShotCapture("播放器会话变化")
             if (value.sessionId != viewportSession) {
                 viewportSession = value.sessionId; touchValid = false; video.resetViewport()
             }
             if (value.phase == PlayerPhase.Error && value.message != lastPlayerError) {
                 lastPlayerError = value.message
-                Toast.makeText(activity, "播放失败，请打开USB诊断查看详情", Toast.LENGTH_LONG).show()
+                Toast.makeText(activity, "播放失败，请重新选择视频后重试", Toast.LENGTH_LONG).show()
             } else if (value.phase != PlayerPhase.Error) lastPlayerError = null
-            status.text = "${value.phase} ${seconds(value.position)} / ${seconds(value.duration)}  ${value.speed?.toString() ?: "未知"}×\n${value.message}"
             hud.text = PlayerInteractionPolicy.hud(value.speed, value.position, value.duration)
             fun compactTime(time: Double?) = time?.takeIf { it.isFinite() && it >= 0 }?.let { String.format(Locale.US, "%.2fs", it) } ?: "--"
             val rate = value.speed?.takeIf { it.isFinite() && it > 0 }?.let { String.format(Locale.US, "%s×", java.math.BigDecimal.valueOf(it).stripTrailingZeros().toPlainString()) } ?: "--×"
             progress.setMarkers(value.loop.a, value.loop.b, value.duration)
             reviewSummary.text = "$rate  A:${compactTime(value.loop.a)}  B:${compactTime(value.loop.b)}  AB:${if (value.loop.active) "开" else "关"}"
-            loopStatus.text = "A=${seconds(value.loop.a)} B=${seconds(value.loop.b)} AB=${if (value.loop.active) "启用" else "关闭"} seekable=${value.seekable}（控件区可滑动）"
             if (pageVisible && foreground && value.phase == PlayerPhase.Playing) activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             else activity.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             binding?.updateTarget(value, foreground && pageVisible)
@@ -258,25 +253,29 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
             refresh()
             maybeAutoLoad()
         }
-        record("PLAYER PANEL created; libmpvKt0.3.0; TourBox auto-init/default mapping; selected video auto-loads paused")
+        record("PLAYER PANEL created; libmpvKt0.3.0; TourBox auto-init/default mapping; selected video auto-loads and starts playback")
     }
 
-    fun setVersionLabel(value: String) { title.text = "TableTennis Review $value" }
+    private var savedMappings = MappingSnapshot(MappingConfig.defaults(),-1,null)
+    fun applyMappings(snapshot: MappingSnapshot) {
+        if (destroyed || snapshot.revision < savedMappings.revision) return
+        savedMappings = snapshot
+        if (snapshot.revision >= 0) binding?.updateMappings(snapshot.config,snapshot.revision)
+        else binding?.setEnabled(false)
+        syncMapping()
+    }
 
     fun bindInput(events: TourBoxInputEvents) {
         check(binding == null)
         val handler = Handler(Looper.getMainLooper())
         binding = TourBoxPlayerBinding(events, controller, Executor { task ->
             if (!handler.post(task)) throw RejectedExecutionException("UI handler stopped")
-        }, { SystemClock.elapsedRealtimeNanos() }, { journal.append(it) }, { value ->
-            if (!destroyed) {
-                mappingStatus.text = "接纳=${value.admitted} 待办=${value.pending} 取消=${value.cancelled} 拒绝=${value.rejected} 忽略=${value.ignored}\n${value.fault ?: value.notice ?: "Knob逐帧/按下播放；Scroll±5秒/按下切速；C1记A/C2记B/Top切AB"}"
-            }
-        }, { journal.failure.get() == null })
+        }, { SystemClock.elapsedRealtimeNanos() }, { journal.append(it) }, { _ -> }, { journal.failure.get() == null },
+            screenshot = { guard,origin -> takeScreenshot(guard,origin) })
+        if (savedMappings.revision >= 0) binding?.updateMappings(savedMappings.config,savedMappings.revision)
         binding?.approveUsbSession(usbSession)
         binding?.updateTarget(controller.state, foreground && pageVisible)
     }
-    fun setTourBoxStatus(value: String) { if (tourBoxStatus.text.toString() != value) tourBoxStatus.text = value }
     fun setTourBoxState(authorized: Boolean, session: Long?) {
         val changed = usbSession != session
         usbAuthorized = authorized
@@ -289,15 +288,17 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
     }
     private fun syncMapping() {
         val bridge = binding ?: return
-        if (!clipHolding && TourBoxControlUiPolicy.automatic(usbAuthorized, usbSession != null, bridge.status().fault != null) &&
+        if (savedMappings.revision >= 0 && !controlHolding && TourBoxControlUiPolicy.automatic(usbAuthorized, usbSession != null, bridge.status().fault != null) &&
             foreground && pageVisible && controller.state.loaded && !bridge.status().enabled) bridge.setEnabled(true)
     }
     private fun suspendMapping() { binding?.setEnabled(false) }
     private fun maybeAutoLoad() {
-        if (!pendingAutoLoad || clipHolding || choosingDocument || destroyed || !PlayerPolicy.canInitialize(selected != null, foreground, pageVisible, controller.state)) return
+        if (!pendingAutoLoad || controlHolding || choosingDocument || destroyed || !PlayerPolicy.canInitialize(selected != null, foreground, pageVisible, controller.state)) return
         pendingAutoLoad = false
-        record("AUTO LOAD selected local video; initial pause=yes; first frame requires visual verification")
-        admission(controller.initialize(checkNotNull(selected).toString()))
+        record("AUTO LOAD selected local video; initial pause=no; playback requires visual verification")
+        val uri = checkNotNull(selected).toString()
+        admission(if (reloadPaused) controller.initializePaused(uri) else controller.initialize(uri))
+        reloadPaused = false
     }
     private fun setFullscreen(value: Boolean) {
         fullscreen = value
@@ -306,6 +307,7 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
         updateProgressLayout()
         setPadding(if (value) 0 else 12, if (value) 0 else 8, if (value) 0 else 12, if (value) 0 else 8)
         onFullscreenChanged(value)
+        refresh()
         record("FULLSCREEN=$value; no USB/session recreation requested")
     }
     fun exitFullscreen(): Boolean {
@@ -315,6 +317,9 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
     }
     override fun onConfigurationChanged(configuration: android.content.res.Configuration) {
         super.onConfigurationChanged(configuration)
+        abortShotCapture("截图期间方向变化")
+        shotEditor?.resize()
+        bookmarkDialog?.resize()
         fun resizeButtons(group: ViewGroup) {
             for (i in 0 until group.childCount) {
                 val child = group.getChildAt(i)
@@ -326,6 +331,7 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
         updateProgressLayout()
     }
     private fun handleVideoTouch(event: MotionEvent): Boolean {
+        if (shotHolding || bookmarkHolding) return true
         val landscape = fullscreen || resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
         if (event.actionMasked == MotionEvent.ACTION_DOWN) {
             verticalGesture = null; volumeFailed = false; touchValid = true
@@ -426,6 +432,7 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
     }
     private fun updateProgressVisibility() {
         progressContainer.visibility = if (progressOverlay.visible) View.VISIBLE else View.GONE
+        floatingBookmark.visibility = if (fullscreen && progressOverlay.visible) View.VISIBLE else View.GONE
     }
     private fun seconds(value: Double?): String = value?.let { String.format(Locale.ROOT, "%.3fs", it) } ?: "未知"
     private fun admission(value: CommandAdmission) {
@@ -435,7 +442,7 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
         }
     }
     private fun submit(command: PlayerCommand) {
-        if (!foreground || !pageVisible || clipHolding) return
+        if (!foreground || !pageVisible || controlHolding) return
         if (journal.failure.get() != null) { record("播放器日志写入失败，请停止测试并保留证据"); return }
         binding?.cancelPending("屏幕操作优先")
         admission(controller.execute(command))
@@ -444,12 +451,19 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
     private fun refresh() {
         clipStatus.visibility = if (clipHolding) View.VISIBLE else View.GONE
         val value = controller.state
-        progress.isEnabled = !clipHolding && foreground && pageVisible && value.loaded && !value.busy && value.seekable && (value.duration?.let { it.isFinite() && it > 0 } == true)
-        choose.isEnabled = !clipHolding && value.phase != PlayerPhase.Initializing && !value.busy
-        initialize.isEnabled = !clipHolding && PlayerPolicy.canInitialize(selected != null, foreground, pageVisible, value)
-        release.isEnabled = !clipHolding && (value.sessionId != 0L || value.busy)
-        actions.forEach { it.isEnabled = !clipHolding && foreground && pageVisible && value.loaded && !value.busy }
-        clipStart.isEnabled = !clipHolding && foreground && pageVisible && value.loaded && !value.busy && selected != null &&
+        playPause.text = PlaybackButtonUi.label(value.phase)
+        settingsEntry.isEnabled = SettingsUiPolicy.canOpen(value.phase,value.busy,controlHolding)
+        screenshotEntry.isEnabled = !controlHolding && !scrubbing && foreground && pageVisible && value.loaded && !value.busy
+        bookmarkEntry.isEnabled = BookmarkUiPolicy.canOpen(value,foreground,pageVisible,controlHolding,scrubbing,selected != null)
+        floatingBookmark.isEnabled = bookmarkEntry.isEnabled
+        floatingBookmark.visibility = if (fullscreen && progressOverlay.visible) View.VISIBLE else View.GONE
+        floatingShot.isEnabled = screenshotEntry.isEnabled
+        floatingShot.visibility = if (fullscreen) View.VISIBLE else View.GONE
+        fullSwitch.isEnabled = !controlHolding
+        progress.isEnabled = !controlHolding && foreground && pageVisible && value.loaded && !value.busy && value.seekable && (value.duration?.let { it.isFinite() && it > 0 } == true)
+        choose.isEnabled = !controlHolding && value.phase != PlayerPhase.Initializing && !value.busy
+        actions.forEach { it.isEnabled = !controlHolding && foreground && pageVisible && value.loaded && !value.busy }
+        clipStart.isEnabled = !controlHolding && foreground && pageVisible && value.loaded && !value.busy && selected != null &&
             runCatching { value.loop.enabled(value.duration) }.isSuccess
         clipSave.isEnabled = foreground && clipExporter.state.phase == ClipExportPhase.Ready
         clipCancel.isEnabled = clipHolding
@@ -457,9 +471,123 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
         if (foreground && (exportBusy || (pageVisible && value.phase == PlayerPhase.Playing))) activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         else activity.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
+    private fun openBookmarks() {
+        val state = controller.state
+        if (!BookmarkUiPolicy.canOpen(state,foreground,pageVisible,controlHolding,scrubbing,selected != null)) return
+        val source = BookmarkSource(checkNotNull(selected).toString(),state.sessionId)
+        val lease = ClipBookmarkSession(source)
+        bookmarkLease = lease; suspendMapping(); verticalGesture = null; touchValid = false
+        val window = ClipBookmarkDialog(activity,bookmarkStore,source,
+            usable = { bookmarkLease === lease && lease.isOpen(source) && !destroyed && foreground && pageVisible &&
+                selected?.toString() == source.videoUri && controller.state.sessionId == source.playerSession },
+            onSaveCurrent = { saveCurrentBookmark(lease) }, onRestore = { restoreBookmark(lease,it) },
+            onClosed = { if (bookmarkLease === lease) { cancelBookmarks("关闭列表"); syncMapping(); refresh() } })
+        bookmarkDialog = window; window.setPlayerState(state)
+        val accepted = controller.executeGuarded(PlayerCommand.SetPaused(true),{ lease.isOpen(source) },"bookmark-list")
+        if (accepted is CommandAdmission.Rejected) { cancelBookmarks("无法暂停"); admission(accepted); syncMapping(); refresh(); return }
+        window.setPlayerState(controller.state); window.show(); refresh()
+    }
+    private fun saveCurrentBookmark(lease: ClipBookmarkSession) {
+        if (bookmarkLease !== lease || controller.state.busy || !foreground || !pageVisible) return
+        val source = lease.source; val token = lease.beginSnapshot(); if (token == 0L) return
+        val window = bookmarkDialog ?: run { lease.finish(token); return }
+        window.setWorking(true)
+        fun finished() {
+            if (bookmarkLease === lease && lease.finish(token)) { window.setWorking(false); refresh() }
+        }
+        val accepted = controller.prepareReviewSnapshot({ lease.isCurrent(token,source) }) { result ->
+            if (bookmarkLease !== lease || !lease.isCurrent(token,source)) return@prepareReviewSnapshot
+            when(result) {
+                is ReviewPreparation.Rejected -> { window.showMessage(result.reason); finished() }
+                is ReviewPreparation.Ready -> {
+                    if (result.snapshot.sessionId != source.playerSession) { window.showMessage("原视频会话已失效"); finished() }
+                    else window.promptSave(result.snapshot,{ lease.isCurrent(token,source) },::finished)
+                }
+            }
+        }
+        if (accepted is CommandAdmission.Rejected) { window.showMessage(accepted.reason); finished() }
+    }
+    private fun restoreBookmark(lease: ClipBookmarkSession, selectedItem: ClipBookmark) {
+        if (bookmarkLease !== lease || controller.state.busy || !foreground || !pageVisible) return
+        val source = lease.source
+        val item = bookmarkStore.snapshot().catalog.forVideo(source.videoUri).singleOrNull { it.id == selectedItem.id } ?: return
+        val token = lease.beginRestore(); if (token == 0L) return
+        val window = bookmarkDialog; bookmarkDialog = null; window?.dispose(false)
+        binding?.cancelPending("恢复片段书签"); refresh()
+        fun finished(reason: String?) {
+            if (bookmarkLease !== lease || !lease.isCurrent(token,source)) return
+            lease.finish(token); lease.close(); bookmarkLease = null
+            if (reason != null && foreground && !destroyed) Toast.makeText(activity,reason,Toast.LENGTH_LONG).show()
+            syncMapping(); refresh()
+        }
+        val accepted = controller.restoreReview(ReviewPreset(item.a,item.b,item.speed),{ lease.isCurrent(token,source) }) { result ->
+            finished((result as? ReviewRestoreResult.Rejected)?.reason)
+        }
+        if (accepted is CommandAdmission.Rejected) finished(accepted.reason)
+    }
+    private fun cancelBookmarks(reason: String) {
+        val owned = bookmarkLease ?: return
+        owned.close(); bookmarkLease = null
+        val window = bookmarkDialog; bookmarkDialog = null; window?.dispose(false)
+        record("BOOKMARK CLOSE reason=$reason；原视频来源授权失效")
+    }
+    private fun abortShotCapture(reason: String) {
+        if (shotGate.phase != ShotPhase.Capturing) return
+        shotGate.end(); shotCapture.cancel(); record("SCREENSHOT CANCEL $reason")
+        if (!destroyed) { syncMapping(); refresh() }
+    }
+    private fun takeScreenshot(authorization: () -> Boolean = { true }, origin: String = "screen"): CommandAdmission {
+        val source = selected ?: return CommandAdmission.Rejected("请先选择视频")
+        val state = controller.state
+        if (destroyed || controlHolding || scrubbing || !foreground || !pageVisible || !state.loaded || state.busy || !runCatching { authorization() }.getOrDefault(false)) return CommandAdmission.Rejected("截图未就绪或来源已失效")
+        if (journal.failure.get() != null) { Toast.makeText(activity,"日志异常，截图未开始",Toast.LENGTH_SHORT).show(); return CommandAdmission.Rejected("运行日志异常") }
+        val token = shotGate.begin(state.sessionId,video.width,video.height)
+        if (token == 0L) return CommandAdmission.Rejected("已有截图操作")
+        shotSourceSession = state.sessionId
+        suspendMapping(); verticalGesture = null; touchValid = false; refresh()
+        record("SCREENSHOT BEGIN session=$shotSourceSession token=$token origin=$origin")
+        fun current() = runCatching { authorization() }.getOrDefault(false) && !destroyed && foreground && pageVisible && selected == source &&
+            shotGate.matches(token,controller.state.sessionId,video.width,video.height)
+        fun failure(reason: String) {
+            if (!shotGate.current(token)) return
+            shotGate.end(); record("SCREENSHOT FAILED $reason")
+            if (foreground && !destroyed) Toast.makeText(activity,reason,Toast.LENGTH_LONG).show()
+            if (!destroyed) { syncMapping(); refresh() }
+        }
+        val admission = controller.prepareScreenshotGuarded(authorization) { prepared ->
+            if (!current()) { failure("截图会话已变化"); return@prepareScreenshotGuarded }
+            when(prepared) {
+                is ScreenshotPreparation.Rejected -> failure(prepared.reason)
+                is ScreenshotPreparation.Ready -> {
+                    if (prepared.sessionId != shotSourceSession) { failure("截图来源已失效"); return@prepareScreenshotGuarded }
+                    if (!shotCapture.capture(::current) { captured ->
+                        val bitmap = captured.getOrNull()
+                        if (!current()) { bitmap?.recycle(); failure("截图已过期"); return@capture }
+                        if (bitmap == null) { failure("截图失败：${captured.exceptionOrNull()?.message}"); return@capture }
+                        if (!shotGate.accept(token)) { bitmap.recycle(); return@capture }
+                        val image = ShotBitmap(bitmap)
+                        try {
+                            shotEditor = ScreenshotEditor(activity,image,source,shotGate,token,{
+                                if (shotGate.current(token)) {
+                                    shotEditor = null; shotGate.end()
+                                    if (!destroyed) { syncMapping(); maybeAutoLoad(); refresh() }
+                                }
+                            },::record).also { it.show() }
+                            record("SCREENSHOT EDIT token=$token size=${bitmap.width}x${bitmap.height}")
+                        } catch(e: Exception) { image.close(); shotEditor?.dispose(); shotEditor = null; failure("无法打开编辑：${e.message}") }
+                        catch(e: OutOfMemoryError) { image.close(); shotEditor?.dispose(); shotEditor = null; failure("编辑图片内存不足") }
+                        refresh()
+                    }) failure("前次截图仍未回收，请稍后再试")
+                }
+            }
+        }
+        if (admission is CommandAdmission.Rejected) failure(admission.reason)
+        return admission
+    }
+
     private fun prepareClip() {
         val source = selected ?: return
-        if (clipHolding || !foreground || !pageVisible || journal.failure.get() != null) return
+        if (controlHolding || !foreground || !pageVisible || journal.failure.get() != null) return
         val uiToken = ++clipUiEpoch
         clipPreparing = true; clipStatus.text = "正在暂停并冻结A/B与实际倍速"; suspendMapping(); refresh()
         val admission = controller.prepareExport { preparation ->
@@ -545,14 +673,7 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
         }.onFailure { clipStatus.text = "无法打开保存选择器：${it.message}；临时片段保留"; record(clipStatus.text.toString()) }
     }
 
-    private fun record(message: String) {
-        journal.append(message)
-        if (destroyed) return
-        recent.addLast("${java.time.LocalTime.now()} $message")
-        while (recent.size > 100) recent.removeFirst()
-        logView.text = recent.joinToString("\n")
-        journal.failure.get()?.let { status.text = "诊断文件写入失败：$it" }
-    }
+    private fun record(message: String) { journal.append(message) }
     @Suppress("DEPRECATION")
     private fun pick() {
         choosingDocument = true
@@ -561,15 +682,8 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
         }, PICK) }.onFailure { choosingDocument = false; record("选片失败 ${it.message}") }
     }
-    @Suppress("DEPRECATION")
-    private fun export() {
-        record("EXPORT requested; picker may background Activity and release player/stop USB")
-        runCatching { activity.startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-            type = "text/plain"; addCategory(Intent.CATEGORY_OPENABLE)
-            putExtra(Intent.EXTRA_TITLE, "review-player-${System.currentTimeMillis()}.txt")
-        }, EXPORT) }.onFailure { record("导出选择器失败 ${it.message}") }
-    }
     fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?): Boolean {
+        if (requestCode == ScreenshotEditor.SAVE) { shotEditor?.result(resultCode,data); refresh(); return true }
         if (requestCode == SAVE_CLIP) {
             val destination = data?.data
             if (resultCode == Activity.RESULT_OK && destination != null) {
@@ -577,7 +691,7 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
             } else { clipStatus.text = "保存已取消，临时片段仍在；可另存或丢弃"; record(clipStatus.text.toString()) }
             refresh(); return true
         }
-        if (requestCode != PICK && requestCode != EXPORT) return false
+        if (requestCode != PICK) return false
         if (requestCode == PICK) choosingDocument = false
         if (resultCode != Activity.RESULT_OK) { record("选片/导出已取消，不自动恢复播放"); return true }
         val uri = data?.data ?: return true
@@ -588,25 +702,34 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
                     .onFailure { record("持久授权未取得 ${it.javaClass.simpleName}；临时权限另行验证") }
             }
             pendingAutoLoad = false
+            reloadPaused = false
             suspendMapping()
             controller.release("选择新文件")
             video.resetViewport()
             selected = uri
             pendingAutoLoad = true
-            record("已选择本地文档，自动初始化并保持暂停（不记录完整URI）")
+            record("已选择本地文档，自动初始化并开始播放（不记录完整URI）")
             maybeAutoLoad()
             refresh() // Required after replacing selected; covers the first-pick regression.
-        } else {
-            journal.export(activity.applicationContext.contentResolver, uri) { message ->
-                activity.runOnUiThread { if (!destroyed) record(message) }
-            }
         }
+
         return true
     }
-    fun restoreState(bundle: Bundle?) { selected = bundle?.getString("review.selectedUri")?.let(Uri::parse); pendingAutoLoad = selected != null; refresh() }
-    fun saveState(bundle: Bundle) { selected?.let { bundle.putString("review.selectedUri", it.toString()) } }
-    fun onHostStart() { foreground = true; binding?.updateTarget(controller.state, pageVisible); record("HOST START; selected video auto-loads paused"); syncMapping(); maybeAutoLoad(); refresh() }
+    fun restoreState(bundle: Bundle?) {
+        selected = bundle?.getString("review.selectedUri")?.let(Uri::parse)
+        reloadPaused = bundle?.getBoolean("review.reloadPaused",false) ?: false
+        pendingAutoLoad = selected != null; refresh()
+    }
+    fun saveState(bundle: Bundle) {
+        selected?.let { bundle.putString("review.selectedUri",it.toString()) }
+        bundle.putBoolean("review.reloadPaused",PlayerResumePolicy.pausedForRecreation(reloadPaused,shotHolding || bookmarkHolding,pageVisible))
+    }
+    fun onHostStart() { foreground = true; binding?.updateTarget(controller.state, pageVisible); record("HOST START; selected video auto-loads and starts playback"); syncMapping(); maybeAutoLoad(); refresh() }
     fun onHostStop() {
+        if (PlayerResumePolicy.pausedAfterStop(shotHolding || bookmarkHolding,pageVisible)) reloadPaused = true
+        foreground = false
+        cancelBookmarks("应用进入后台")
+        abortShotCapture("应用进入后台")
         foreground = false; verticalGesture = null; clipUiEpoch++; clipPreparing = false
         clipConfirmation?.dismiss(); clipConfirmation = null
         if (clipExporter.state.phase in listOf(ClipExportPhase.Preparing, ClipExportPhase.Exporting, ClipExportPhase.Saving)) clipExporter.cancel("应用进入后台")
@@ -614,11 +737,12 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
         binding?.updateTarget(controller.state, false); controller.release("宿主进入后台"); refresh()
     }
     fun setPageVisible(value: Boolean) {
+        if (!value) cancelBookmarks("离开播放器页")
         val leaving = !value && pageVisible
         pageVisible = value
         binding?.updateTarget(controller.state, foreground && pageVisible)
         if (!value) suspendMapping()
-        if (leaving && !clipHolding) controller.pauseForPageChange()
+        if (leaving && !controlHolding) controller.pauseForPageChange()
         if (value) { syncMapping(); maybeAutoLoad() }
         if (!value) activity.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         refresh()
@@ -626,6 +750,9 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
     fun close() {
         if (destroyed) return
         destroyed = true; foreground = false; clipPreparing = false
+        cancelBookmarks("宿主销毁")
+        abortShotCapture("宿主销毁")
+        shotEditor?.dispose(); shotEditor = null; shotGate.end()
         clipUiEpoch++; clipConfirmation?.dismiss(); clipConfirmation = null
         clipExporter.close()
         binding?.close(); binding = null

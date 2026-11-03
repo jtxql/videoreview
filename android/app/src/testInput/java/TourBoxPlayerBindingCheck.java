@@ -40,6 +40,9 @@ public final class TourBoxPlayerBindingCheck {
         void emit(PlayerState s){state=s;if(listener!=null)listener.invoke(s);}
         void complete(){emit(state(state.getSessionId(),false));}
         public CommandAdmission initialize(String uri){return CommandAdmission.Accepted.INSTANCE;}
+        public CommandAdmission initializePaused(String uri){throw new AssertionError("mapping must not initialize screenshots");}
+        public CommandAdmission prepareScreenshot(Function1<? super ScreenshotPreparation,Unit> callback){throw new AssertionError("mapping must not capture screenshots");}
+        public CommandAdmission prepareScreenshotGuarded(Function0<Boolean> authorization,Function1<? super ScreenshotPreparation,Unit> callback){throw new AssertionError("mapping must use host screenshot entry");}
         public CommandAdmission execute(PlayerCommand c){throw new AssertionError("guard required");}
         public CommandAdmission executeGuarded(PlayerCommand c,Function0<Boolean> a,String origin){
             ok(!source.gate); if(fail)throw new IllegalStateException("player");
@@ -48,15 +51,20 @@ public final class TourBoxPlayerBindingCheck {
             ok(!source.gate);ok(origin.contains("usbSession=7"));
             commands.add(c);guards.add(a);emit(state(state.getSessionId(),true));return CommandAdmission.Accepted.INSTANCE;
         }
+        public CommandAdmission prepareReviewSnapshot(Function0<Boolean> authorization,Function1<? super ReviewPreparation,Unit> callback){throw new AssertionError("mapping must not create bookmarks");}
+        public CommandAdmission restoreReview(ReviewPreset preset,Function0<Boolean> authorization,Function1<? super ReviewRestoreResult,Unit> callback){throw new AssertionError("mapping must not restore bookmarks");}
         public CommandAdmission prepareExport(Function1<? super ExportPreparation,Unit> callback){throw new AssertionError("mapping must not start export");}
         public void pauseForPageChange(){} public void release(String why){} public void close(){}
     }
     static final class Test implements AutoCloseable {
         Source source=new Source();Ui ui=new Ui();Player player=new Player(source);
-        long clock=1000,seq;boolean healthy=true;List<String> logs=new ArrayList<>();TourBoxPlayerBinding binding;
+        int captures; Function0<Boolean> captureGuard; long clock=1000,seq;boolean healthy=true;List<String> logs=new ArrayList<>();TourBoxPlayerBinding binding;
         Test(){this(32);}
         Test(int capacity){
-            binding=new TourBoxPlayerBinding(source,player,ui,()->clock,s->{logs.add(s);return Unit.INSTANCE;},s->Unit.INSTANCE,()->healthy,capacity,2_000_000_000L);
+            binding=new TourBoxPlayerBinding(source,player,ui,()->clock,s->{logs.add(s);return Unit.INSTANCE;},s->Unit.INSTANCE,()->healthy,capacity,2_000_000_000L,(guard,origin)->{
+                ok(!source.gate);if(!guard.invoke())return new CommandAdmission.Rejected("stale capture");
+                captures++;captureGuard=guard;binding.setEnabled(false);return CommandAdmission.Accepted.INSTANCE;
+            });
             player.setStateListener(s->{binding.updateTarget(s,true);return Unit.INSTANCE;});
             binding.updateTarget(player.state,true);ui.drain();scenarios++;
         }
@@ -67,7 +75,67 @@ public final class TourBoxPlayerBindingCheck {
         void finish(){player.complete();ui.drain();}
         public void close(){binding.close();ui.drain();}
     }
+    static void sensitivityChecks(){
+        try(Test t=new Test()) {
+            t.binding.updateMappings(MappingConfig.defaults().withSensitivity(RotaryControl.Knob,SensitivityLevel.Quarter),1);t.enable();
+            for(int i=0;i<3;i++)t.send(t.cw());t.ui.drain();ok(t.player.commands.isEmpty());
+            t.send(t.cw());t.ui.drain();ok(t.player.commands.equals(Arrays.asList(PlayerCommand.StepForward.INSTANCE)));
+            ok(t.binding.status().getReceived()==4);ok(t.binding.status().getIgnored()==3);
+        }
+        try(Test t=new Test()) {
+            t.binding.updateMappings(MappingConfig.defaults().withSensitivity(RotaryControl.Knob,SensitivityLevel.Quadruple),1);t.enable();
+            t.send(t.cw());ok(t.binding.status().getPending()==4);t.ui.drain();for(int i=1;i<4;i++)t.finish();
+            ok(t.player.commands.equals(Arrays.asList(PlayerCommand.StepForward.INSTANCE,PlayerCommand.StepForward.INSTANCE,PlayerCommand.StepForward.INSTANCE,PlayerCommand.StepForward.INSTANCE)));
+            ok(t.binding.status().getReceived()==1&&t.binding.status().getAdmitted()==4);
+            ok(t.logs.stream().anyMatch(x->x.contains("part=4/4")));
+        }
+        try(Test t=new Test()) {
+            t.binding.updateMappings(MappingConfig.defaults().withSensitivity(RotaryControl.Scroll,SensitivityLevel.Quadruple),1);t.enable();
+            t.send(new TourBoxInputEvent.ScrollUp(t.stamp(0x49)));t.ui.drain();
+            ok(t.player.commands.equals(Arrays.asList(new PlayerCommand.SeekRelative(20))));
+        }
+        for(MappingAction action:new MappingAction[]{MappingAction.TogglePause,MappingAction.MarkA,MappingAction.SpeedUp,MappingAction.Screenshot})try(Test t=new Test()){
+            t.binding.updateMappings(MappingConfig.defaults().with(MappingInput.KnobCW,action).withSensitivity(RotaryControl.Knob,SensitivityLevel.Quadruple),1);t.enable();
+            t.send(t.cw());ok(t.binding.status().getPending()==1);t.ui.drain();ok(t.captures+(t.player.commands.size())==1);
+        }
+        try(Test t=new Test()) {
+            t.binding.updateMappings(MappingConfig.defaults().with(MappingInput.Knob,MappingAction.FrameForward).withSensitivity(RotaryControl.Knob,SensitivityLevel.Quadruple),1);t.enable();
+            t.send(new TourBoxInputEvent.ButtonDown(TourBoxButton.KNOB,t.stamp(0x37)));t.ui.drain();ok(t.player.commands.size()==1);
+        }
+        for(int mode=0;mode<6;mode++)try(Test t=new Test()){
+            MappingConfig cfg=MappingConfig.defaults().withSensitivity(RotaryControl.Knob,SensitivityLevel.Half);
+            t.binding.updateMappings(cfg,1);t.enable();t.send(t.cw());t.ui.drain();ok(t.player.commands.isEmpty());
+            switch(mode){
+                case 0:t.binding.setEnabled(false);t.enable();break;
+                case 1:t.binding.updateMappings(cfg.with(MappingInput.Top,MappingAction.Play),2);break;
+                case 2:t.binding.approveUsbSession(null);t.binding.approveUsbSession(7L);t.enable();break;
+                case 3:t.player.emit(Player.state(12,false));t.enable();break;
+                case 4:t.binding.cancelPending("screen");break;
+                case 5:t.binding.updateTarget(t.player.state,false);t.binding.updateTarget(t.player.state,true);t.enable();break;
+            }
+            t.send(t.cw());t.ui.drain();ok(t.player.commands.isEmpty());t.send(t.cw());t.ui.drain();ok(t.player.commands.size()==1);
+        }
+        try(Test t=new Test()) {
+            t.binding.updateMappings(MappingConfig.defaults().withSensitivity(RotaryControl.Knob,SensitivityLevel.Half),1);t.enable();t.send(t.cw());
+            t.player.emit(Player.state(11,true));t.player.complete();t.send(t.cw());t.ui.drain();ok(t.player.commands.size()==1);
+        }
+        try(Test t=new Test(32)) {
+            t.binding.updateMappings(MappingConfig.defaults().withSensitivity(RotaryControl.Knob,SensitivityLevel.Quadruple),1);t.enable();
+            for(int i=0;i<1000;i++)t.send(t.cw());ok(t.binding.status().getPending()==32);ok(t.binding.status().getReceived()==1000);ok(t.binding.status().getCancelled()==3968);
+            t.ui.drain();t.binding.approveUsbSession(null);t.finish();ok(t.player.commands.size()==1);ok(!t.player.guards.get(0).invoke());
+        }
+        try(Test t=new Test()) {
+            t.binding.updateMappings(MappingConfig.defaults().withSensitivity(RotaryControl.Knob,SensitivityLevel.Quadruple),1);t.enable();t.send(t.cw());
+            t.clock+=2_000_000_001L;t.ui.drain();ok(t.player.commands.isEmpty());ok(t.binding.status().getCancelled()==4);
+        }
+        try(Test t=new Test()) {
+            t.binding.updateMappings(MappingConfig.defaults().withSensitivity(RotaryControl.Knob,SensitivityLevel.Double),1);t.enable();t.send(t.cw());
+            t.send(new TourBoxInputEvent.KnobCounterClockwise(t.stamp(4)));t.ui.drain();for(int i=1;i<4;i++)t.finish();
+            ok(t.player.commands.equals(Arrays.asList(PlayerCommand.StepForward.INSTANCE,PlayerCommand.StepForward.INSTANCE,PlayerCommand.StepBackward.INSTANCE,PlayerCommand.StepBackward.INSTANCE)));
+        }
+    }
     public static void main(String[] args) throws Exception {
+        sensitivityChecks();
         try(Test t=new Test()) {
             t.send(t.cw());t.ui.drain();ok(t.player.commands.isEmpty());ok(t.binding.status().getIgnored()==1);
             t.enable();
@@ -142,6 +210,38 @@ public final class TourBoxPlayerBindingCheck {
         try(Test t=new Test(32)) {
             t.enable();for(int i=0;i<1000;i++)t.send(t.cw());ok(t.binding.status().getPending()==32);ok(t.binding.status().getCancelled()==968);
             t.ui.drain();for(int i=1;i<32;i++)t.finish();ok(t.player.commands.size()==32);ok(t.binding.status().getEnabled());
+        }
+        try(Test t=new Test()) {
+            t.enable();t.binding.updateMappings(MappingConfig.defaults().with(MappingInput.KnobCW,MappingAction.None).with(MappingInput.Short,MappingAction.Play),1);
+            t.send(t.cw());t.send(new TourBoxInputEvent.ButtonDown(TourBoxButton.SHORT,t.stamp(3)));t.ui.drain();
+            ok(t.player.commands.equals(Arrays.asList(new PlayerCommand.SetPaused(false))));
+        }
+        try(Test t=new Test()) {
+            t.enable();t.send(t.cw());t.send(t.cw());t.binding.updateMappings(MappingConfig.defaults().with(MappingInput.KnobCW,MappingAction.FrameBackward),1);
+            t.ui.drain();ok(t.player.commands.isEmpty());ok(t.binding.status().getCancelled()==2);
+            t.send(t.cw());t.ui.drain();ok(t.player.commands.equals(Arrays.asList(PlayerCommand.StepBackward.INSTANCE)));
+            ok(!t.binding.updateMappings(MappingConfig.defaults(),0));
+        }
+        try(Test t=new Test()) {
+            t.enable();t.send(t.cw());t.ui.drain();Function0<Boolean> old=t.player.guards.get(0);
+            t.binding.updateMappings(MappingConfig.defaults().with(MappingInput.Top,MappingAction.Play),1);ok(!old.invoke());
+        }
+        try(Test t=new Test()) {
+            t.enable();t.binding.updateMappings(MappingConfig.defaults().with(MappingInput.C1,MappingAction.Screenshot),1);
+            t.send(new TourBoxInputEvent.ButtonDown(TourBoxButton.C1,t.stamp(0x22)));t.ui.drain();
+            ok(t.captures==1&&t.player.commands.isEmpty());ok(t.captureGuard.invoke()); // own suspension must not revoke capture
+            t.source.active=8;ok(!t.captureGuard.invoke());
+        }
+        try(Test t=new Test()) {
+            t.enable();t.binding.updateMappings(MappingConfig.defaults().with(MappingInput.C1,MappingAction.Screenshot),1);
+            t.send(new TourBoxInputEvent.ButtonDown(TourBoxButton.C1,t.stamp(0x22)));t.ui.drain();ok(t.captureGuard.invoke());
+            t.binding.updateMappings(MappingConfig.defaults(),2);ok(!t.captureGuard.invoke());
+        }
+        try(Test t=new Test(2)) {
+            t.enable();t.binding.updateMappings(MappingConfig.defaults().with(MappingInput.KnobCW,MappingAction.Screenshot),1);
+            t.send(t.cw());t.send(t.cw());t.send(new TourBoxInputEvent.ButtonDown(TourBoxButton.TOP,t.stamp(2)));
+            ok(t.binding.status().getPending()==2&&t.binding.status().getCancelled()==1);t.ui.drain();
+            ok(t.captures==1&&t.binding.status().getPending()==0);
         }
         System.out.println("TourBoxPlayerBindingCheck: "+scenarios+" scenarios, "+assertions+" assertions passed (no Android/native/USB)");
     }

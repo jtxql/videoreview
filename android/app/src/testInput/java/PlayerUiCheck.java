@@ -36,6 +36,33 @@ public final class PlayerUiCheck {
         ok(marks.fraction(1.0,0.0)==null);ok(marks.fraction(-1.0,10.0)==null);
         ok(marks.fraction(11.0,10.0)==null);ok(marks.fraction(Double.NaN,10.0)==null);
         ok(marks.fraction(1.0,Double.POSITIVE_INFINITY)==null);
+        ok(PlaybackButtonUi.INSTANCE.label(io.tabletennisreview.player.PlayerPhase.Playing).equals("暂停"));
+        ok(PlaybackButtonUi.INSTANCE.label(io.tabletennisreview.player.PlayerPhase.Buffering).equals("暂停"));
+        ok(PlaybackButtonUi.INSTANCE.label(io.tabletennisreview.player.PlayerPhase.Paused).equals("播放"));
+        ok(PlaybackButtonUi.INSTANCE.label(io.tabletennisreview.player.PlayerPhase.Released).equals("播放"));
+        ok(PlayerResumePolicy.INSTANCE.pausedAfterStop(false,false));ok(PlayerResumePolicy.INSTANCE.pausedAfterStop(true,true));
+        ok(PlayerResumePolicy.INSTANCE.pausedAfterStop(true,false));ok(!PlayerResumePolicy.INSTANCE.pausedAfterStop(false,true));
+        ok(SettingsUiPolicy.INSTANCE.canOpen(io.tabletennisreview.player.PlayerPhase.Paused,false,false));
+        ok(SettingsUiPolicy.INSTANCE.canOpen(io.tabletennisreview.player.PlayerPhase.Released,false,false));
+        ok(!SettingsUiPolicy.INSTANCE.canOpen(io.tabletennisreview.player.PlayerPhase.Initializing,false,false));
+        ok(!SettingsUiPolicy.INSTANCE.canOpen(io.tabletennisreview.player.PlayerPhase.Loading,false,false));
+        ok(!SettingsUiPolicy.INSTANCE.canOpen(io.tabletennisreview.player.PlayerPhase.Playing,true,false));
+        ok(!SettingsUiPolicy.INSTANCE.canOpen(io.tabletennisreview.player.PlayerPhase.Playing,false,true));
+        // Android can save state before onStop marks reloadPaused; modal visibility must suffice.
+        boolean[][] resumeCases={{false,false,false,true},{false,false,true,false},{false,true,false,true},{false,true,true,true},
+          {true,false,false,true},{true,false,true,true},{true,true,false,true},{true,true,true,true}};
+        for(boolean[] c:resumeCases)ok(PlayerResumePolicy.INSTANCE.pausedForRecreation(c[0],c[1],c[2])==c[3]);
+        io.tabletennisreview.player.PlayerState loaded=new io.tabletennisreview.player.PlayerState(5,io.tabletennisreview.player.PlayerPhase.Paused,true,false,0.0,10.0,1.0,true,new io.tabletennisreview.player.LoopPoints(),"ready");
+        ok(BookmarkUiPolicy.INSTANCE.canOpen(loaded,true,true,false,false,true));
+        ok(!BookmarkUiPolicy.INSTANCE.canOpen(loaded,false,true,false,false,true));
+        ok(!BookmarkUiPolicy.INSTANCE.canOpen(loaded,true,false,false,false,true));
+        ok(!BookmarkUiPolicy.INSTANCE.canOpen(loaded,true,true,true,false,true));
+        ok(!BookmarkUiPolicy.INSTANCE.canOpen(loaded,true,true,false,true,true));
+        ok(!BookmarkUiPolicy.INSTANCE.canOpen(loaded,true,true,false,false,false));
+        ok(!BookmarkUiPolicy.INSTANCE.canOpen(new io.tabletennisreview.player.PlayerState(),true,true,false,false,true));
+        // Bookmark modal uses the same explicit pause-intent policy as screenshot/settings.
+        ok(PlayerResumePolicy.INSTANCE.pausedForRecreation(false,true,true));
+        ok(PlayerResumePolicy.INSTANCE.pausedAfterStop(true,true));
         System.out.println("PlayerUiCheck: "+count+" assertions passed; automatic control gates and overlay state (no Android/USB)");
     }
 }

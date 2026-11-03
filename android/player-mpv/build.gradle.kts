@@ -19,7 +19,7 @@ val playerCheckRuntime = files(providers.provider {
 })
 val compilePlayerChecks by tasks.registering(JavaCompile::class) {
     dependsOn("compileDebugKotlin")
-    source("src/testPlayer/java/PlayerCheck.java")
+    source("src/testPlayer/java/PlayerCheck.java", "src/testPlayer/java/ReviewPresetCheck.java")
     classpath = files(playerKotlinClasses) + playerCheckRuntime
     destinationDirectory.set(playerCheckClasses)
     options.encoding = "UTF-8"
@@ -31,3 +31,10 @@ tasks.register<JavaExec>("testPlayer") {
     mainClass.set("PlayerCheck")
 }
 tasks.named("check") { dependsOn("testPlayer") }
+
+tasks.register<JavaExec>("testReviewPresets") {
+    dependsOn(compilePlayerChecks)
+    classpath = files(playerCheckClasses, playerKotlinClasses) + playerCheckRuntime
+    mainClass.set("ReviewPresetCheck")
+}
+tasks.named("check") { dependsOn("testReviewPresets") }

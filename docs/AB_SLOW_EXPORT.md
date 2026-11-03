@@ -43,10 +43,12 @@
 
 最终离线验证：Debug构建、全部既有回归及新导出测试通过；导出191断言，播放器175、UI38、自动初始化124、映射318、输入497、异步回收105、连接代次48断言，94字节配置回归通过。Lint：app 0错误/28警告，player-mpv 0错误/0警告，video-export 0错误/1警告（缓存空间预检查UsableSpace）。签名和16KB ZIP对齐检查通过，git diff --check通过；USB管理与输入源码相对568fb89未变化。
 
-APK：android/app/build/outputs/apk/debug/app-debug.apk，版本0.5.0-ab-export/code10，SHA-256：1E719E09F30AD1CECFFCD57000103971BCFDFD374B53F9C805B31E6C31F94DB4。未安装或访问手机/USB，真实导出待验证。
+APK：android/app/build/outputs/apk/debug/app-debug.apk，版本0.5.0-ab-export/code10，SHA-256：1E719E09F30AD1CECFFCD57000103971BCFDFD374B53F9C805B31E6C31F94DB4。开发代理未安装或访问手机/USB；后续用户真机反馈见下文。
 
 纯JVM覆盖请求/速度/时长、状态迁移、重复开始、进程所有权、旧回调、保存与取消竞态、复制中断、读/写/flush/close失败。它不执行Android MediaCodec或真实视频导出。
 
-## 待用户授权的真机验收
+## 真机验收方法与用户反馈
 
 本轮未安装。覆盖安装后先用2–3秒普通SDR片段，五档各导出并另存，重新打开成片检查画面边界、正常1倍速播放时的慢动作时长、声音和同步；另测静音、取消、另存取消/重试、后台取消、竖横屏方向及原视频未改。再扩大到高分辨率/高帧率。日志需区分CLIP REQUEST、Exporting、Ready、Saving和Saved，不以进度代替最终文件成功。
+
+2026-11-02用户反馈：短片段五档倍速、有声/静音、导出边界、时长、画面方向、音画同步、取消及另存流程均已验证。记为用户真机验收通过；本轮未由开发代理连接设备复测，不据此扩大到所有格式、分辨率或设备的兼容性保证。

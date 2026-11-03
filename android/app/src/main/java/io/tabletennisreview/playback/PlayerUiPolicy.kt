@@ -53,3 +53,26 @@ object ProgressMarkers {
         return position / duration
     }
 }
+
+/** Native TogglePaused resolves the actual pause property; this label follows observed playback state. */
+object PlaybackButtonUi {
+    fun label(phase: io.tabletennisreview.player.PlayerPhase): String = when (phase) {
+        io.tabletennisreview.player.PlayerPhase.Playing, io.tabletennisreview.player.PlayerPhase.Buffering -> "暂停"
+        else -> "播放"
+    }
+}
+
+object PlayerResumePolicy {
+    fun pausedForRecreation(pendingPause: Boolean, screenshotHeld: Boolean, playerVisible: Boolean): Boolean = pendingPause || screenshotHeld || !playerVisible
+    fun pausedAfterStop(screenshotHeld: Boolean, playerVisible: Boolean): Boolean = screenshotHeld || !playerVisible
+}
+object SettingsUiPolicy {
+    fun canOpen(phase: io.tabletennisreview.player.PlayerPhase, busy: Boolean, held: Boolean): Boolean =
+        !busy && !held && phase != io.tabletennisreview.player.PlayerPhase.Initializing && phase != io.tabletennisreview.player.PlayerPhase.Loading
+}
+
+object BookmarkUiPolicy {
+    fun canOpen(state: io.tabletennisreview.player.PlayerState, foreground: Boolean, pageVisible: Boolean,
+        held: Boolean, scrubbing: Boolean, hasUri: Boolean): Boolean = foreground && pageVisible && !held && !scrubbing &&
+        hasUri && state.loaded && !state.busy && state.seekable && state.sessionId > 0
+}

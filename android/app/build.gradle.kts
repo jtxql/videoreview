@@ -11,8 +11,8 @@ android {
         applicationId = "io.tabletennisreview.usbdiagnostics"
         minSdk = 26
         targetSdk = 37
-        versionCode = 15
-        versionName = "0.5.5-ab-markers"
+        versionCode = 20
+        versionName = "0.7.0-clip-bookmarks"
         ndk { abiFilters += "arm64-v8a" }
     }
     compileOptions {
@@ -39,7 +39,7 @@ val inputCheckRuntime = files(providers.provider {
 })
 val compileInputChecks by tasks.registering(JavaCompile::class) {
     dependsOn("compileDebugKotlin")
-    source("src/testInput/java/PlayerUiCheck.java", "src/testInput/java/AutoInitCheck.java", "src/testInput/java/TourBoxPlayerBindingCheck.java", "src/testInput/java/TourBoxInputCheck.java", "../../scripts/tests/Config94Check.java", "src/testInput/java/UsbAsyncCleanupCheck.java", "src/testInput/java/UsbGenerationCheck.java")
+    source("src/testInput/java/ClipBookmarkCheck.java", "src/testInput/java/RotationSensitivityCheck.java", "src/testInput/java/TourBoxMappingCheck.java", "src/testInput/java/ScreenshotCheck.java", "src/testInput/java/PlayerUiCheck.java", "src/testInput/java/AutoInitCheck.java", "src/testInput/java/TourBoxPlayerBindingCheck.java", "src/testInput/java/TourBoxInputCheck.java", "../../scripts/tests/Config94Check.java", "src/testInput/java/UsbAsyncCleanupCheck.java", "src/testInput/java/UsbGenerationCheck.java")
     classpath = files(appKotlinClasses) + inputCheckRuntime
     destinationDirectory.set(inputCheckClasses)
     options.encoding = "UTF-8"
@@ -101,3 +101,31 @@ tasks.register<JavaExec>("testPlayerUi") {
 tasks.named("check") { dependsOn("testPlayerUi") }
 
 tasks.named("check") { dependsOn(":video-export:testClipExport") }
+
+tasks.register<JavaExec>("testScreenshot") {
+    dependsOn(compileInputChecks)
+    classpath = files(inputCheckClasses, appKotlinClasses) + inputCheckRuntime
+    mainClass.set("ScreenshotCheck")
+}
+tasks.named("check") { dependsOn("testScreenshot") }
+
+tasks.register<JavaExec>("testTourBoxMappings") {
+    dependsOn(compileInputChecks)
+    classpath = files(inputCheckClasses, appKotlinClasses) + inputCheckRuntime
+    mainClass.set("TourBoxMappingCheck")
+}
+tasks.named("check") { dependsOn("testTourBoxMappings") }
+
+tasks.register<JavaExec>("testRotationSensitivity") {
+    dependsOn(compileInputChecks)
+    classpath = files(inputCheckClasses, appKotlinClasses) + inputCheckRuntime
+    mainClass.set("RotationSensitivityCheck")
+}
+tasks.named("check") { dependsOn("testRotationSensitivity") }
+
+tasks.register<JavaExec>("testClipBookmarks") {
+    dependsOn(compileInputChecks)
+    classpath = files(inputCheckClasses, appKotlinClasses) + inputCheckRuntime
+    mainClass.set("ClipBookmarkCheck")
+}
+tasks.named("check") { dependsOn("testClipBookmarks") }

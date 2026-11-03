@@ -47,15 +47,24 @@ sealed interface ExportPreparation {
     data class Ready(val snapshot: PlayerExportSnapshot) : ExportPreparation
     data class Rejected(val reason: String) : ExportPreparation
 }
+sealed interface ScreenshotPreparation {
+    data class Ready(val sessionId: Long) : ScreenshotPreparation
+    data class Rejected(val reason: String) : ScreenshotPreparation
+}
 /** All entry points/listeners are main-thread owned; commands perform native work off the UI. */
 interface PlayerController {
     val state: PlayerState
     fun setStateListener(listener: ((PlayerState) -> Unit)?)
     fun setLogListener(listener: ((String) -> Unit)?)
     fun initialize(contentUri: String): CommandAdmission
+    fun initializePaused(contentUri: String): CommandAdmission
+    fun prepareScreenshot(callback: (ScreenshotPreparation) -> Unit): CommandAdmission
+    fun prepareScreenshotGuarded(authorization: () -> Boolean, callback: (ScreenshotPreparation) -> Unit): CommandAdmission
     fun execute(command: PlayerCommand): CommandAdmission
     /** Short authorization, rechecked before each native request; never hold USB locks around native code. */
     fun executeGuarded(command: PlayerCommand, authorization: () -> Boolean, origin: String): CommandAdmission
+    fun prepareReviewSnapshot(authorization: () -> Boolean, callback: (ReviewPreparation) -> Unit): CommandAdmission
+    fun restoreReview(preset: ReviewPreset, authorization: () -> Boolean, callback: (ReviewRestoreResult) -> Unit): CommandAdmission
     fun prepareExport(callback: (ExportPreparation) -> Unit): CommandAdmission
     fun pauseForPageChange()
     fun release(reason: String)
