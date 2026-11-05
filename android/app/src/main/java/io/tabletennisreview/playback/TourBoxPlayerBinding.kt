@@ -19,12 +19,14 @@ class TourBoxPlayerBinding @JvmOverloads constructor(
     private val player: PlayerController,
     private val ui: Executor,
     private val now: () -> Long, // same elapsedRealtimeNanos clock as the RX stamps
+    private val gestureTimer: GestureTimer,
     private val auditSink: (String) -> Unit,
     private val publish: (MappingStatus) -> Unit,
     private val logHealthy: () -> Boolean,
     private val capacity: Int = 32,
     private val maxAgeNanos: Long = 2_000_000_000L,
     private val screenshot: (((() -> Boolean), String) -> CommandAdmission)? = null,
+    private val bookmarkAction: ((MappingAction, () -> Boolean, String) -> CommandAdmission)? = null,
 ) : AutoCloseable {
     private data class Target(val revision: Long, val enabled: Boolean, val visible: Boolean,
         val session: Long, val ready: Boolean, val busy: Boolean)
@@ -37,6 +39,10 @@ class TourBoxPlayerBinding @JvmOverloads constructor(
     @Volatile private var target = Target(0, false, false, 0, false, false)
     @Volatile private var closed = false
     private val rotationProcessor = RotationProcessor()
+    private val gesture = TourBoxButtonGesture()
+    private var gestureCancellation: AutoCloseable? = null
+    private var gestureDeadline: Long? = null
+    private var gestureSerial = 0L
     private var mappings = MappingConfig.defaults()
     private var mappingRevision = 0L
     private var configurationApplied = false
@@ -63,7 +69,7 @@ class TourBoxPlayerBinding @JvmOverloads constructor(
         }
     }
     private fun discardLocked(): Int {
-        rotationProcessor.reset()
+        rotationProcessor.reset(); cancelGestureLocked(); gesture.reset()
         val n = queue.size
         queue.forEach { it.cancellationRecorded.set(true) }
         cancelled += n; queue.clear()
@@ -145,55 +151,88 @@ class TourBoxPlayerBinding @JvmOverloads constructor(
         } } catch (_: Exception) { return false }
         return valid
     }
+    private fun cancelGestureLocked() {
+        gestureSerial++; gestureDeadline = null
+        val cancel = gestureCancellation; gestureCancellation = null; runCatching { cancel?.close() }
+    }
+    private fun armGestureLocked(deadline: Long?) {
+        if (deadline == gestureDeadline && (deadline == null || gestureCancellation != null)) return
+        cancelGestureLocked()
+        if (deadline == null || closed || !target.enabled) return
+        gestureDeadline = deadline
+        val serial = gestureSerial; val revision = target.revision; val epoch = configEpoch
+        try { gestureCancellation = gestureTimer.schedule(deadline) {
+            val messages = mutableListOf<String>()
+            synchronized(lock) {
+                if (closed || serial != gestureSerial || revision != target.revision || epoch != configEpoch ||
+                    !target.enabled || !target.visible || !target.ready) return@synchronized
+                gestureCancellation = null; gestureDeadline = null
+                val result = gesture.expire(now())
+                result.dispatches.forEach { enqueueLocked(it,messages) }
+                armGestureLocked(result.deadlineNanos)
+            }
+            if (messages.isNotEmpty()) audit(messages.joinToString("\n"))
+            schedule()
+        } } catch (_: RuntimeException) { disableLocked("双击定时器调度失败") }
+    }
     private fun receive(event: TourBoxInputEvent) {
         val messages = mutableListOf<String>()
         synchronized(lock) {
             if (closed) return
             received++
-            val input = MappingInput.fromEvent(event)
-            val action = input?.let { mappings.action(it) } ?: MappingAction.None
-            if (!inputReady(event) || !target.enabled || !target.visible || !target.ready || input == null) ignored++
-            else if (action == MappingAction.None) {
-                // Even a reverse direction mapped to None must clear this control's frame remainder.
-                rotationProcessor.plan(input,action,SensitivityLevel.Normal,event.stamp.receivedNanos)
-                ignored++
-            }
+            if (!inputReady(event) || !target.enabled || !target.visible || !target.ready) ignored++
             else if (!logHealthy()) { disableLocked("诊断文件写入失败"); cancelled++; messages += "FAULT 日志失败；本次输入取消" }
             else {
-                val control = when(input) {
-                    MappingInput.KnobCW, MappingInput.KnobCCW -> RotaryControl.Knob
-                    MappingInput.ScrollUp, MappingInput.ScrollDown -> RotaryControl.Scroll
-                    else -> null
-                }
-                val plan = rotationProcessor.plan(input,action,control?.let { mappings.sensitivity(it) } ?: SensitivityLevel.Normal,event.stamp.receivedNanos)
-                if (plan.repeats == 0) {
-                    ignored++
-                    messages += "ACCUMULATED ${origin(event)} action=${action.id} reason=低灵敏度累计，尚未形成播放器命令"
-                }
-                repeat(plan.repeats) { index ->
-                    if (queue.size >= capacity) {
-                        // Retain the established bounded queue policy for EACH derived command.
-                        val oldestRotation = queue.firstOrNull { isRotation(it.event) && it.action.repeatable }
-                        if (oldestRotation != null) {
-                            queue.remove(oldestRotation)
-                            if (oldestRotation.cancellationRecorded.compareAndSet(false, true)) cancelled++
-                            messages += "PRESSURE evicted=${origin(oldestRotation)} capacity=$capacity"
-                        } else {
-                            cancelled++
-                            messages += "PRESSURE rejected=${origin(event)} part=${index+1}/${plan.repeats} capacity=$capacity；队内均为受保护动作，不挤占"
-                        }
-                        notice = "积压已跳过旧旋转/拒绝超量动作，控制保持启用；累计取消=$cancelled"
-                    }
-                    if (queue.size < capacity) {
-                        val item = Pending(event,action,configEpoch,target,plan.commandOverride ?: action.command(),index+1,plan.repeats)
-                        queue.addLast(item)
-                        messages += "QUEUED ${origin(item)} playerSession=${target.session} action=${action.id} command=${item.command}"
-                    }
-                }
+                val result = gesture.accept(event,mappings.action(MappingInput.TourBoxDouble) != MappingAction.None,now())
+                if (MappingInput.fromEvent(event) == null) ignored++
+                result.dispatches.forEach { enqueueLocked(it,messages) }
+                if (result.dispatches.isEmpty() && event is TourBoxInputEvent.ButtonDown && event.button == TourBoxButton.TOURBOX)
+                    messages += "GESTURE WAIT ${origin(event)} deadline=${result.deadlineNanos}"
+                armGestureLocked(result.deadlineNanos)
             }
         }
         if (messages.isNotEmpty()) audit(messages.joinToString("\n"))
-        schedule() // at most one pending Runnable, not an unbounded Handler queue
+        schedule()
+    }
+    private fun enqueueLocked(dispatch: GestureDispatch, messages: MutableList<String>) {
+        val event = dispatch.event; val input = dispatch.input
+        if (!inputReady(event)) { ignored++; return }
+        val action = mappings.action(input)
+        messages += "GESTURE input=${input.id} ${origin(event)}"
+        if (action == MappingAction.None) {
+            rotationProcessor.plan(input,action,SensitivityLevel.Normal,event.stamp.receivedNanos)
+            ignored++; return
+        }
+    val control = when(input) {
+        MappingInput.KnobCW, MappingInput.KnobCCW -> RotaryControl.Knob
+        MappingInput.ScrollUp, MappingInput.ScrollDown -> RotaryControl.Scroll
+        else -> null
+    }
+    val plan = rotationProcessor.plan(input,action,control?.let { mappings.sensitivity(it) } ?: SensitivityLevel.Normal,event.stamp.receivedNanos)
+    if (plan.repeats == 0) {
+        ignored++
+        messages += "ACCUMULATED ${origin(event)} action=${action.id} reason=低灵敏度累计，尚未形成播放器命令"
+    }
+    repeat(plan.repeats) { index ->
+        if (queue.size >= capacity) {
+            // Retain the established bounded queue policy for EACH derived command.
+            val oldestRotation = queue.firstOrNull { isRotation(it.event) && it.action.repeatable }
+            if (oldestRotation != null) {
+                queue.remove(oldestRotation)
+                if (oldestRotation.cancellationRecorded.compareAndSet(false, true)) cancelled++
+                messages += "PRESSURE evicted=${origin(oldestRotation)} capacity=$capacity"
+            } else {
+                cancelled++
+                messages += "PRESSURE rejected=${origin(event)} part=${index+1}/${plan.repeats} capacity=$capacity；队内均为受保护动作，不挤占"
+            }
+            notice = "积压已跳过旧旋转/拒绝超量动作，控制保持启用；累计取消=$cancelled"
+        }
+        if (queue.size < capacity) {
+            val item = Pending(event,action,configEpoch,target,plan.commandOverride ?: action.command(),index+1,plan.repeats)
+            queue.addLast(item)
+            messages += "QUEUED ${origin(item)} playerSession=${target.session} action=${action.id} command=${item.command}"
+        }
+    }
     }
     private fun schedule() {
         val post = synchronized(lock) { if (closed || scheduled) false else { scheduled = true; true } }
@@ -246,6 +285,9 @@ class TourBoxPlayerBinding @JvmOverloads constructor(
                     if (item.action == MappingAction.Screenshot) {
                         if (!captureLease(item)) CommandAdmission.Rejected("截图来源已失效")
                         else screenshot?.invoke({ captureLease(item) },origin(item)) ?: CommandAdmission.Rejected("截图入口不可用")
+                    } else if (item.action in listOf(MappingAction.SaveBookmark,MappingAction.PreviousBookmark,MappingAction.NextBookmark)) {
+                        if (!captureLease(item)) CommandAdmission.Rejected("书签来源已失效")
+                        else bookmarkAction?.invoke(item.action,{ captureLease(item) },origin(item)) ?: CommandAdmission.Rejected("书签入口不可用")
                     } else player.executeGuarded(checkNotNull(item.command), { permit(item) }, origin(item))
                 }
                 catch (error: Exception) {

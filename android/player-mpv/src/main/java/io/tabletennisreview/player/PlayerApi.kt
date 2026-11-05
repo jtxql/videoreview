@@ -64,6 +64,7 @@ interface PlayerController {
     /** Short authorization, rechecked before each native request; never hold USB locks around native code. */
     fun executeGuarded(command: PlayerCommand, authorization: () -> Boolean, origin: String): CommandAdmission
     fun prepareReviewSnapshot(authorization: () -> Boolean, callback: (ReviewPreparation) -> Unit): CommandAdmission
+    fun prepareReviewSnapshotKeepingPlayback(authorization: () -> Boolean, callback: (ReviewPreparation) -> Unit): CommandAdmission
     fun restoreReview(preset: ReviewPreset, authorization: () -> Boolean, callback: (ReviewRestoreResult) -> Unit): CommandAdmission
     fun prepareExport(callback: (ExportPreparation) -> Unit): CommandAdmission
     fun pauseForPageChange()

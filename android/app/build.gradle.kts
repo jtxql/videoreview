@@ -11,8 +11,8 @@ android {
         applicationId = "io.tabletennisreview.usbdiagnostics"
         minSdk = 26
         targetSdk = 37
-        versionCode = 20
-        versionName = "0.7.0-clip-bookmarks"
+        versionCode = 21
+        versionName = "0.7.1-tourbox-bookmarks"
         ndk { abiFilters += "arm64-v8a" }
     }
     compileOptions {
@@ -39,7 +39,7 @@ val inputCheckRuntime = files(providers.provider {
 })
 val compileInputChecks by tasks.registering(JavaCompile::class) {
     dependsOn("compileDebugKotlin")
-    source("src/testInput/java/ClipBookmarkCheck.java", "src/testInput/java/RotationSensitivityCheck.java", "src/testInput/java/TourBoxMappingCheck.java", "src/testInput/java/ScreenshotCheck.java", "src/testInput/java/PlayerUiCheck.java", "src/testInput/java/AutoInitCheck.java", "src/testInput/java/TourBoxPlayerBindingCheck.java", "src/testInput/java/TourBoxInputCheck.java", "../../scripts/tests/Config94Check.java", "src/testInput/java/UsbAsyncCleanupCheck.java", "src/testInput/java/UsbGenerationCheck.java")
+    source("src/testInput/java/TourBoxButtonGestureCheck.java", "src/testInput/java/BookmarkPlaybackCheck.java", "src/testInput/java/ClipBookmarkCheck.java", "src/testInput/java/RotationSensitivityCheck.java", "src/testInput/java/TourBoxMappingCheck.java", "src/testInput/java/ScreenshotCheck.java", "src/testInput/java/PlayerUiCheck.java", "src/testInput/java/AutoInitCheck.java", "src/testInput/java/TourBoxPlayerBindingCheck.java", "src/testInput/java/TourBoxInputCheck.java", "../../scripts/tests/Config94Check.java", "src/testInput/java/UsbAsyncCleanupCheck.java", "src/testInput/java/UsbGenerationCheck.java")
     classpath = files(appKotlinClasses) + inputCheckRuntime
     destinationDirectory.set(inputCheckClasses)
     options.encoding = "UTF-8"
@@ -129,3 +129,17 @@ tasks.register<JavaExec>("testClipBookmarks") {
     mainClass.set("ClipBookmarkCheck")
 }
 tasks.named("check") { dependsOn("testClipBookmarks") }
+
+tasks.register<JavaExec>("testBookmarkPlayback") {
+    dependsOn(compileInputChecks)
+    classpath = files(inputCheckClasses, appKotlinClasses) + inputCheckRuntime
+    mainClass.set("BookmarkPlaybackCheck")
+}
+tasks.named("check") { dependsOn("testBookmarkPlayback") }
+
+tasks.register<JavaExec>("testTourBoxButtonGestures") {
+    dependsOn(compileInputChecks)
+    classpath = files(inputCheckClasses, appKotlinClasses) + inputCheckRuntime
+    mainClass.set("TourBoxButtonGestureCheck")
+}
+tasks.named("check") { dependsOn("testTourBoxButtonGestures") }

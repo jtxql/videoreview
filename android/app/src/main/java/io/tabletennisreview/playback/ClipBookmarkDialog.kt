@@ -82,10 +82,11 @@ class ClipBookmarkDialog(private val activity: Activity, private val store: Clip
     fun promptSave(value: ReviewSnapshot, guard: () -> Boolean, finished: () -> Unit) {
         if (disposed || !guard()) { finished(); return }
         working = false
-        val next = snapshot.catalog.forVideo(source.videoUri).size+1
-        name("片段$next",guard,finished) { clean,done ->
+        val defaultName = snapshot.catalog.defaultName(source.videoUri)
+        name(defaultName,guard,finished) { clean,done ->
             if (!guard()) { done(false,"原视频会话已变化"); return@name }
-            val item = ClipBookmark(UUID.randomUUID().toString(),source.videoUri,clean,value.preset.a,value.preset.b,value.preset.speed,System.currentTimeMillis())
+            val item = try { ClipBookmark(UUID.randomUUID().toString(),source.videoUri,clean,value.preset.a,value.preset.b,value.preset.speed,System.currentTimeMillis().coerceAtLeast(0)) }
+                catch (invalid: IllegalArgumentException) { done(false,invalid.message ?: "书签来源无效"); return@name }
             mutate(BookmarkMutation.Add(item),done)
         }
     }

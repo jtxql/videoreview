@@ -26,3 +26,12 @@ object ReviewRestorePlan {
             NativeRequest.Command(listOf("seek",preset.a.toString(),"absolute+exact")), NativeRequest.Property("pause","no"))
     }
 }
+
+/** This exact plan also drives the native snapshot loop. Keeping playback emits no pause write. */
+enum class ReviewSnapshotRead { Pause, Speed, Duration }
+object ReviewSnapshotPlan {
+    fun reads(pausePlayback: Boolean): List<ReviewSnapshotRead> = if (pausePlayback)
+        listOf(ReviewSnapshotRead.Pause,ReviewSnapshotRead.Speed,ReviewSnapshotRead.Duration)
+        else listOf(ReviewSnapshotRead.Speed,ReviewSnapshotRead.Duration)
+    fun phaseAfter(current: PlayerPhase, pausePlayback: Boolean): PlayerPhase = if (pausePlayback) PlayerPhase.Paused else current
+}

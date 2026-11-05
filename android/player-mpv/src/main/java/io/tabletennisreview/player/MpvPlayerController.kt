@@ -241,7 +241,10 @@ internal class MpvPlayerController(private val video: MpvView) : PlayerControlle
     }
 
     override fun prepareReviewSnapshot(authorization: () -> Boolean, callback: (ReviewPreparation) -> Unit): CommandAdmission =
-        runReview(null,authorization,callback)
+        runReview(null,authorization,true,callback)
+
+    override fun prepareReviewSnapshotKeepingPlayback(authorization: () -> Boolean, callback: (ReviewPreparation) -> Unit): CommandAdmission =
+        runReview(null,authorization,false,callback)
 
     override fun restoreReview(preset: ReviewPreset, authorization: () -> Boolean, callback: (ReviewRestoreResult) -> Unit): CommandAdmission =
         runReview(preset,authorization) { result -> callback(when(result) {
@@ -250,7 +253,7 @@ internal class MpvPlayerController(private val video: MpvView) : PlayerControlle
         }) }
 
     /** Single busy owner, including delivery after cancellation before the coroutine starts. */
-    private fun runReview(preset: ReviewPreset?, authorization: () -> Boolean, callback: (ReviewPreparation) -> Unit): CommandAdmission {
+    private fun runReview(preset: ReviewPreset?, authorization: () -> Boolean, snapshotPause: Boolean = true, callback: (ReviewPreparation) -> Unit): CommandAdmission {
         mainOnly()
         val player = core ?: return CommandAdmission.Rejected("请先加载视频")
         val jobs = scope ?: return CommandAdmission.Rejected("播放器尚未就绪")
@@ -274,12 +277,19 @@ internal class MpvPlayerController(private val video: MpvView) : PlayerControlle
                     }
                     valid()
                     if (preset == null) {
-                        player.setString("pause","yes").getOrThrow(); valid()
-                        val speed = player.getAsync(MpvProperties.Speed).getOrThrow(); valid()
-                        val duration = player.getAsync(MpvProperties.Duration).getOrThrow(); valid()
-                        val saved = ReviewPreset(checkNotNull(points.a),checkNotNull(points.b),speed)
-                        saved.validated(duration)
-                        ReviewPreparation.Ready(ReviewSnapshot(token,saved,duration))
+                        var speed: Double? = null; var duration: Double? = null
+                        for (read in ReviewSnapshotPlan.reads(snapshotPause)) {
+                            valid()
+                            when(read) {
+                                ReviewSnapshotRead.Pause -> player.setString("pause","yes").getOrThrow()
+                                ReviewSnapshotRead.Speed -> speed = player.getAsync(MpvProperties.Speed).getOrThrow()
+                                ReviewSnapshotRead.Duration -> duration = player.getAsync(MpvProperties.Duration).getOrThrow()
+                            }
+                        }
+                        valid()
+                        val saved = ReviewPreset(checkNotNull(points.a),checkNotNull(points.b),checkNotNull(speed))
+                        saved.validated(checkNotNull(duration))
+                        ReviewPreparation.Ready(ReviewSnapshot(token,saved,checkNotNull(duration)))
                     } else {
                         val duration = player.getAsync(MpvProperties.Duration).getOrThrow(); valid()
                         val requests = ReviewRestorePlan.requests(preset,duration)
@@ -307,7 +317,7 @@ internal class MpvPlayerController(private val video: MpvView) : PlayerControlle
                 val ready = delivered as? ReviewPreparation.Ready
                 emit(if (ready != null && preset != null) state.copy(busy = false,loop = preset.validated(ready.snapshot.duration),
                     speed = preset.speed,phase = PlayerPhase.Playing,message = "已恢复片段书签")
-                    else state.copy(busy = false,phase = if (ready != null) PlayerPhase.Paused else state.phase))
+                    else state.copy(busy = false,phase = if (ready != null) ReviewSnapshotPlan.phaseAfter(state.phase,snapshotPause) else state.phase))
             }
             log("REVIEW END session=$token mode=${if (preset == null) "snapshot" else "restore"} ready=${delivered is ReviewPreparation.Ready}")
             callback(delivered)

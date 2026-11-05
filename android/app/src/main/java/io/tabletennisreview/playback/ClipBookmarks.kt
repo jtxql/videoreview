@@ -32,7 +32,8 @@ class BookmarkCatalog(items: List<ClipBookmark>) {
         require(items.groupingBy { it.videoUri }.eachCount().values.all { it <= 200 }) { "每视频最多200个书签" }
     }
     fun forVideo(uri: String): List<ClipBookmark> = items.filter { it.videoUri == uri }
-        .sortedWith(compareByDescending<ClipBookmark> { it.createdAtMillis }.thenBy { it.id })
+        .sortedWith(compareBy<ClipBookmark> { it.a }.thenBy { it.createdAtMillis }.thenBy { it.id })
+    fun defaultName(uri: String): String = "片段${forVideo(uri).size+1}"
     fun add(item: ClipBookmark) = BookmarkCatalog(items + item)
     private fun requireOwned(id: String, uri: String): ClipBookmark = requireNotNull(items.singleOrNull { it.id == id && it.videoUri == uri }) { "书签不存在或来源不符" }
     fun rename(id: String, uri: String, name: String): BookmarkCatalog {

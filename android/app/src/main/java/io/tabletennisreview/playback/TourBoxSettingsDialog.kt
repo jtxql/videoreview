@@ -26,6 +26,7 @@ class TourBoxSettingsDialog(private val activity: Activity, private val store: T
         dialog.setTitle("TourBox设置")
         val root = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL; setPadding(16,12,16,12) }
         root.addView(connection); root.addView(message)
+        root.addView(TextView(activity).apply { text = "TourBox双击启用时，单击约等待400ms；Long/Tall是实体按钮。"; textSize = 12f })
         val rows = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
         val density = activity.resources.displayMetrics.density
         rows.addView(TextView(activity).apply {

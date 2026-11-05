@@ -49,6 +49,10 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
     private var reloadPaused = false
     private val shotHolding: Boolean get() = shotGate.phase != ShotPhase.Idle || shotEditor != null
     private val bookmarkStore = ClipBookmarkStore.get(activity.applicationContext)
+    private val bookmarkPlayback = BookmarkPlaybackState()
+    private var bookmarkLibrary = bookmarkStore.snapshot()
+    private var bookmarkSubscription: AutoCloseable? = null
+    private var quickBookmarkWrite: AutoCloseable? = null
     private var bookmarkLease: ClipBookmarkSession? = null
     private var bookmarkDialog: ClipBookmarkDialog? = null
     private val bookmarkHolding: Boolean get() = bookmarkLease != null
@@ -73,7 +77,17 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
     private val progressOverlay = PlayerProgressOverlay()
     private val hud = TextView(activity).apply {
         textSize = 14f; setTextColor(android.graphics.Color.WHITE)
-        setBackgroundColor(0x99000000.toInt()); setPadding(8, 4, 8, 4)
+        setBackgroundColor(android.graphics.Color.TRANSPARENT); setPadding(0, 0, 0, 0)
+        isClickable = false; isFocusable = false
+    }
+    private val bookmarkTitle = TextView(activity).apply {
+        textSize = 14f; setTextColor(android.graphics.Color.WHITE); maxLines = 1
+        ellipsize = android.text.TextUtils.TruncateAt.END
+        gravity = android.view.Gravity.END; isClickable = false; isFocusable = false
+    }
+    private val hudBox = LinearLayout(activity).apply {
+        orientation = VERTICAL; gravity = android.view.Gravity.END
+        setBackgroundColor(0x99000000.toInt()); setPadding(8,4,8,4)
         isClickable = false; isFocusable = false
     }
     private val audio = activity.getSystemService(AudioManager::class.java)
@@ -168,7 +182,8 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
             resetViewport.visibility = if (video.viewport.enlarged) View.VISIBLE else View.GONE
             resetViewport.text = String.format(Locale.US, "恢复画面 %.1f×", video.viewport.scale)
         }
-        video.addView(hud, FrameLayout.LayoutParams(-2, -2, android.view.Gravity.TOP or android.view.Gravity.END).apply {
+        hudBox.addView(bookmarkTitle); hudBox.addView(hud)
+        video.addView(hudBox, FrameLayout.LayoutParams(-2, -2, android.view.Gravity.TOP or android.view.Gravity.END).apply {
             val margin = (8 * resources.displayMetrics.density).toInt()
             setMargins(margin, margin, margin, 0)
         })
@@ -224,9 +239,12 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
             (40 * resources.displayMetrics.density).toInt(),android.view.Gravity.END or android.view.Gravity.BOTTOM).apply {
             rightMargin = (88 * resources.displayMetrics.density).toInt(); bottomMargin = (84 * resources.displayMetrics.density).toInt()
         })
+        video.addOnLayoutChangeListener { _,_,_,_,_,_,_,_,_ -> updateBookmarkHud() }
         updateProgressLayout()
         controller.setLogListener(::record)
         controller.setStateListener { value ->
+            bookmarkPlayback.observe(if (value.loaded && selected != null && value.sessionId > 0)
+                BookmarkSource(checkNotNull(selected).toString(),value.sessionId) else null,value.loop)
             if (bookmarkLease?.let { it.source.playerSession != value.sessionId || !value.loaded } == true) cancelBookmarks("播放器会话变化")
             bookmarkDialog?.setPlayerState(value)
             if (shotGate.phase == ShotPhase.Capturing && value.sessionId != shotSourceSession) abortShotCapture("播放器会话变化")
@@ -237,7 +255,7 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
                 lastPlayerError = value.message
                 Toast.makeText(activity, "播放失败，请重新选择视频后重试", Toast.LENGTH_LONG).show()
             } else if (value.phase != PlayerPhase.Error) lastPlayerError = null
-            hud.text = PlayerInteractionPolicy.hud(value.speed, value.position, value.duration)
+            updateBookmarkHud()
             fun compactTime(time: Double?) = time?.takeIf { it.isFinite() && it >= 0 }?.let { String.format(Locale.US, "%.2fs", it) } ?: "--"
             val rate = value.speed?.takeIf { it.isFinite() && it > 0 }?.let { String.format(Locale.US, "%s×", java.math.BigDecimal.valueOf(it).stripTrailingZeros().toPlainString()) } ?: "--×"
             progress.setMarkers(value.loop.a, value.loop.b, value.duration)
@@ -270,8 +288,9 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
         val handler = Handler(Looper.getMainLooper())
         binding = TourBoxPlayerBinding(events, controller, Executor { task ->
             if (!handler.post(task)) throw RejectedExecutionException("UI handler stopped")
-        }, { SystemClock.elapsedRealtimeNanos() }, { journal.append(it) }, { _ -> }, { journal.failure.get() == null },
-            screenshot = { guard,origin -> takeScreenshot(guard,origin) })
+        }, { SystemClock.elapsedRealtimeNanos() }, HandlerGestureTimer(handler) { SystemClock.elapsedRealtimeNanos() }, { journal.append(it) }, { _ -> }, { journal.failure.get() == null },
+            screenshot = { guard,origin -> takeScreenshot(guard,origin) },
+            bookmarkAction = { action,guard,origin -> handleBookmarkAction(action,guard,origin) })
         if (savedMappings.revision >= 0) binding?.updateMappings(savedMappings.config,savedMappings.revision)
         binding?.approveUsbSession(usbSession)
         binding?.updateTarget(controller.state, foreground && pageVisible)
@@ -412,8 +431,7 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
     private fun updateProgressLayout() {
         val landscape = resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
         progressOverlay.layout(landscape, fullscreen)
-        hud.visibility = if (landscape || fullscreen) View.VISIBLE else View.GONE
-        hud.text = PlayerInteractionPolicy.hud(controller.state.speed, controller.state.position, controller.state.duration)
+        updateBookmarkHud()
         val parent = if (progressOverlay.overlay) video else this
         if (progressContainer.parent !== parent) {
             (progressContainer.parent as? ViewGroup)?.removeView(progressContainer)
@@ -471,6 +489,91 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
         if (foreground && (exportBusy || (pageVisible && value.phase == PlayerPhase.Playing))) activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         else activity.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
+    private fun updateBookmarkHud() {
+        if (destroyed) return
+        val value = controller.state
+        val content = BookmarkHudPolicy.compose(bookmarkPlayback.activeName(bookmarkLibrary.catalog),
+            resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE,fullscreen,
+            value.speed,value.position,value.duration)
+        val title = content.name ?: ""; val detail = content.detail ?: ""
+        if (bookmarkTitle.text.toString() != title) bookmarkTitle.text = title
+        val width = (video.width*.6).toInt().coerceAtLeast(1)
+        if (bookmarkTitle.maxWidth != width) bookmarkTitle.maxWidth = width
+        bookmarkTitle.visibility = if (content.name != null) View.VISIBLE else View.GONE
+        if (hud.text.toString() != detail) hud.text = detail
+        hud.visibility = if (content.detail != null) View.VISIBLE else View.GONE
+        hudBox.visibility = if (content.visible) View.VISIBLE else View.GONE
+    }
+    private fun rejectBookmark(reason: String): CommandAdmission.Rejected {
+        if (foreground && !destroyed) Toast.makeText(activity,reason,Toast.LENGTH_SHORT).show()
+        return CommandAdmission.Rejected(reason)
+    }
+    private fun handleBookmarkAction(action: MappingAction, authorization: () -> Boolean, origin: String): CommandAdmission {
+        val state = controller.state
+        if (!BookmarkUiPolicy.canOpen(state,foreground,pageVisible,controlHolding,scrubbing,selected != null) ||
+            !runCatching { authorization() }.getOrDefault(false)) return rejectBookmark("书签操作暂不可用或来源已失效")
+        if (journal.failure.get() != null) return rejectBookmark("日志异常，书签操作未开始")
+        val library = bookmarkStore.snapshot()
+        if (library.revision < 0) return rejectBookmark("正在读取书签，请稍后重试")
+        val source = BookmarkSource(checkNotNull(selected).toString(),state.sessionId)
+        bookmarkPlayback.observe(source,state.loop)
+        val candidate = when(action) {
+            MappingAction.PreviousBookmark -> bookmarkPlayback.candidate(library.catalog,-1)
+            MappingAction.NextBookmark -> bookmarkPlayback.candidate(library.catalog,1)
+            MappingAction.SaveBookmark -> null
+            else -> return rejectBookmark("不是书签动作")
+        }
+        if (action != MappingAction.SaveBookmark && candidate == null) return rejectBookmark("当前视频暂无书签")
+        if (action == MappingAction.SaveBookmark && (!library.writable || runCatching { state.loop.enabled(state.duration) }.isFailure))
+            return rejectBookmark(library.notice ?: "请先标记有效A/B")
+        val lease = ClipBookmarkSession(source); bookmarkLease = lease
+        suspendMapping(); verticalGesture = null; touchValid = false; refresh()
+        record("BOOKMARK ACTION ${action.id} origin=$origin")
+        val accepted = if (candidate != null) restoreBookmark(lease,candidate,authorization) else quickSaveBookmark(lease,authorization)
+        if (accepted is CommandAdmission.Rejected && bookmarkLease === lease) {
+            cancelBookmarks("书签接纳失败"); syncMapping(); refresh()
+        }
+        return accepted
+    }
+    private fun quickSaveBookmark(lease: ClipBookmarkSession, authorization: () -> Boolean): CommandAdmission {
+        val source = lease.source; val token = lease.beginSnapshot()
+        if (token == 0L) return rejectBookmark("已有书签操作")
+        fun current() = lease.isCurrent(token,source) && runCatching { authorization() }.getOrDefault(false)
+        fun finish(reason: String?) {
+            if (bookmarkLease !== lease || !lease.isCurrent(token,source)) return
+            quickBookmarkWrite = null; lease.finish(token); lease.close(); bookmarkLease = null
+            if (reason != null && foreground && !destroyed) Toast.makeText(activity,reason,Toast.LENGTH_SHORT).show()
+            syncMapping(); updateBookmarkHud(); refresh()
+        }
+        val accepted = controller.prepareReviewSnapshotKeepingPlayback(::current) { prepared ->
+            if (bookmarkLease !== lease || !lease.isCurrent(token,source)) return@prepareReviewSnapshotKeepingPlayback
+            if (!current()) { finish("书签来源已失效"); return@prepareReviewSnapshotKeepingPlayback }
+            when(prepared) {
+                is ReviewPreparation.Rejected -> finish(prepared.reason)
+                is ReviewPreparation.Ready -> {
+                    if (prepared.snapshot.sessionId != source.playerSession) { finish("书签来源已失效"); return@prepareReviewSnapshotKeepingPlayback }
+                    val library = bookmarkStore.snapshot()
+                    if (!library.writable) { finish(library.notice ?: "书签不可写"); return@prepareReviewSnapshotKeepingPlayback }
+                    val preset = prepared.snapshot.preset
+                    val item = try { ClipBookmark(java.util.UUID.randomUUID().toString(),source.videoUri,library.catalog.defaultName(source.videoUri),
+                        preset.a,preset.b,preset.speed,System.currentTimeMillis().coerceAtLeast(0)) }
+                        catch (invalid: IllegalArgumentException) { finish(invalid.message ?: "书签来源无效"); return@prepareReviewSnapshotKeepingPlayback }
+                    if (!current()) { finish("书签来源已失效"); return@prepareReviewSnapshotKeepingPlayback }
+                    quickBookmarkWrite = bookmarkStore.apply(library.revision,BookmarkMutation.Add(item)) { result ->
+                        if (bookmarkLease !== lease || !lease.isCurrent(token,source)) return@apply
+                        val latest = bookmarkStore.snapshot()
+                        if (latest.revision >= bookmarkLibrary.revision) bookmarkLibrary = latest
+                        if (current() && bookmarkPlayback.acceptSave(result,item,source,controller.state.loop)) {
+                            if (foreground && !destroyed) Toast.makeText(activity,"已保存 ${item.name}",Toast.LENGTH_SHORT).show()
+                        }
+                        finish(if (!result.success) result.message else null)
+                    }
+                }
+            }
+        }
+        if (accepted is CommandAdmission.Rejected) finish(accepted.reason)
+        return accepted
+    }
     private fun openBookmarks() {
         val state = controller.state
         if (!BookmarkUiPolicy.canOpen(state,foreground,pageVisible,controlHolding,scrubbing,selected != null)) return
@@ -507,11 +610,13 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
         }
         if (accepted is CommandAdmission.Rejected) { window.showMessage(accepted.reason); finished() }
     }
-    private fun restoreBookmark(lease: ClipBookmarkSession, selectedItem: ClipBookmark) {
-        if (bookmarkLease !== lease || controller.state.busy || !foreground || !pageVisible) return
+    private fun restoreBookmark(lease: ClipBookmarkSession, selectedItem: ClipBookmark, authorization: () -> Boolean = { true }): CommandAdmission {
+        if (bookmarkLease !== lease || controller.state.busy || !foreground || !pageVisible || !runCatching { authorization() }.getOrDefault(false))
+            return rejectBookmark("书签来源已失效或播放器忙")
         val source = lease.source
-        val item = bookmarkStore.snapshot().catalog.forVideo(source.videoUri).singleOrNull { it.id == selectedItem.id } ?: return
-        val token = lease.beginRestore(); if (token == 0L) return
+        val item = bookmarkStore.snapshot().catalog.forVideo(source.videoUri).singleOrNull { it.id == selectedItem.id }
+            ?: return rejectBookmark("书签已不存在")
+        val token = lease.beginRestore(); if (token == 0L) return rejectBookmark("已有书签操作")
         val window = bookmarkDialog; bookmarkDialog = null; window?.dispose(false)
         binding?.cancelPending("恢复片段书签"); refresh()
         fun finished(reason: String?) {
@@ -520,14 +625,21 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
             if (reason != null && foreground && !destroyed) Toast.makeText(activity,reason,Toast.LENGTH_LONG).show()
             syncMapping(); refresh()
         }
-        val accepted = controller.restoreReview(ReviewPreset(item.a,item.b,item.speed),{ lease.isCurrent(token,source) }) { result ->
+        val accepted = controller.restoreReview(ReviewPreset(item.a,item.b,item.speed),{ lease.isCurrent(token,source) && runCatching { authorization() }.getOrDefault(false) }) { result ->
+            if (bookmarkLease === lease && lease.isCurrent(token,source) && runCatching { authorization() }.getOrDefault(false)) {
+                val latest = bookmarkStore.snapshot()
+                if (latest.revision >= bookmarkLibrary.revision) bookmarkLibrary = latest
+                bookmarkPlayback.acceptRestore(result,item.id,source); updateBookmarkHud()
+            }
             finished((result as? ReviewRestoreResult.Rejected)?.reason)
         }
         if (accepted is CommandAdmission.Rejected) finished(accepted.reason)
+        return accepted
     }
     private fun cancelBookmarks(reason: String) {
         val owned = bookmarkLease ?: return
         owned.close(); bookmarkLease = null
+        quickBookmarkWrite?.close(); quickBookmarkWrite = null
         val window = bookmarkDialog; bookmarkDialog = null; window?.dispose(false)
         record("BOOKMARK CLOSE reason=$reason；原视频来源授权失效")
     }
@@ -724,8 +836,14 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
         selected?.let { bundle.putString("review.selectedUri",it.toString()) }
         bundle.putBoolean("review.reloadPaused",PlayerResumePolicy.pausedForRecreation(reloadPaused,shotHolding || bookmarkHolding,pageVisible))
     }
-    fun onHostStart() { foreground = true; binding?.updateTarget(controller.state, pageVisible); record("HOST START; selected video auto-loads and starts playback"); syncMapping(); maybeAutoLoad(); refresh() }
+    fun onHostStart() {
+        bookmarkSubscription?.close()
+        bookmarkSubscription = bookmarkStore.subscribe { value ->
+            if (!destroyed && value.revision >= bookmarkLibrary.revision) { bookmarkLibrary = value; updateBookmarkHud() }
+        }
+        foreground = true; binding?.updateTarget(controller.state, pageVisible); record("HOST START; selected video auto-loads and starts playback"); syncMapping(); maybeAutoLoad(); refresh() }
     fun onHostStop() {
+        bookmarkSubscription?.close(); bookmarkSubscription = null
         if (PlayerResumePolicy.pausedAfterStop(shotHolding || bookmarkHolding,pageVisible)) reloadPaused = true
         foreground = false
         cancelBookmarks("应用进入后台")
@@ -750,6 +868,7 @@ class PlayerPanel(private val activity: Activity) : LinearLayout(activity) {
     fun close() {
         if (destroyed) return
         destroyed = true; foreground = false; clipPreparing = false
+        bookmarkSubscription?.close(); bookmarkSubscription = null
         cancelBookmarks("宿主销毁")
         abortShotCapture("宿主销毁")
         shotEditor?.dispose(); shotEditor = null; shotGate.end()

@@ -40,8 +40,8 @@ public final class ClipBookmarkCheck {
   storeChecks();sessionChecks();
   String u="content://videos/1",v="content://videos/2";
   BookmarkCatalog c=new BookmarkCatalog(Collections.emptyList());c=c.add(item(1,u,"接发球")).add(item(2,u,"接发球")).add(item(3,v,"接发球"));
-  ok(c.forVideo(u).size()==2);ok(c.forVideo(v).size()==1);ok(c.forVideo(u).get(0).getId().equals(id(2)));
-  ok(c.rename(id(1),u,"正手失误").forVideo(u).get(1).getName().equals("正手失误"));ok(c.forVideo(u).get(1).getName().equals("接发球"));
+  ok(c.forVideo(u).size()==2);ok(c.forVideo(v).size()==1);ok(c.forVideo(u).get(0).getId().equals(id(1)));
+  ok(c.rename(id(1),u,"正手失误").forVideo(u).get(0).getName().equals("正手失误"));ok(c.forVideo(u).get(0).getName().equals("接发球"));
   ok(c.delete(id(1),u).forVideo(u).size()==1);BookmarkCatalog fixed=c;
   rejects(()->fixed.delete(id(1),v));rejects(()->fixed.rename(id(1),v,"x"));rejects(()->fixed.add(item(1,u,"x")));
   for(double speed:new double[]{.1,.25,.5,.75,1}){

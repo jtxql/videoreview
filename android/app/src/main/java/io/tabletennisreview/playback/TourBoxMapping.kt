@@ -8,7 +8,7 @@ enum class MappingInput(val id: String, val label: String) {
     ScrollUp("scroll-up","Scroll 上滚"), ScrollDown("scroll-down","Scroll 下滚"),
     Knob("knob","Knob 按下"), Scroll("scroll","Scroll 按下"), Top("top","Top 按下"),
     C1("c1","C1 按下"), C2("c2","C2 按下"), Short("short","Short 按下"),
-    Tall("tall","Long / Tall 按下"), TourBox("tourbox","TourBox 按下");
+    Tall("tall","Long / Tall 按下"), TourBox("tourbox","TourBox 按下"), TourBoxDouble("tourbox-double","TourBox 双击");
     companion object {
         @JvmStatic fun fromEvent(event: TourBoxInputEvent): MappingInput? = when(event) {
             is TourBoxInputEvent.KnobClockwise -> KnobCW
@@ -32,9 +32,10 @@ enum class MappingAction(val id: String, val label: String, val repeatable: Bool
     Speed01("speed-01","设为0.1倍",true), Speed025("speed-025","设为0.25倍",true), Speed05("speed-05","设为0.5倍",true),
     Speed075("speed-075","设为0.75倍",true), Speed1("speed-1","设为1倍",true),
     MarkA("mark-a","记A"), MarkB("mark-b","记B"), EnableLoop("enable-ab","启用AB"), ClearLoop("clear-ab","清除AB"),
-    ToggleLoop("toggle-ab","启用 / 清除AB"), SeekA("seek-a","回A"), Screenshot("screenshot","截图标注");
+    ToggleLoop("toggle-ab","启用 / 清除AB"), SeekA("seek-a","回A"), Screenshot("screenshot","截图标注"),
+    SaveBookmark("bookmark-save","保存当前片段书签"), PreviousBookmark("bookmark-previous","上一条书签"), NextBookmark("bookmark-next","下一条书签");
     fun command(): PlayerCommand? = when(this) {
-        None, Screenshot -> null
+        None, Screenshot, SaveBookmark, PreviousBookmark, NextBookmark -> null
         TogglePause -> PlayerCommand.TogglePaused; Play -> PlayerCommand.SetPaused(false); Pause -> PlayerCommand.SetPaused(true)
         FrameForward -> PlayerCommand.StepForward; FrameBackward -> PlayerCommand.StepBackward
         SeekForward -> PlayerCommand.SeekRelative(5.0); SeekBackward -> PlayerCommand.SeekRelative(-5.0)
@@ -45,7 +46,7 @@ enum class MappingAction(val id: String, val label: String, val repeatable: Bool
         ClearLoop -> PlayerCommand.ClearLoop; ToggleLoop -> PlayerCommand.ToggleLoop; SeekA -> PlayerCommand.SeekA
     }
 }
-data class MappingLoad(val config: MappingConfig, val notice: String?)
+data class MappingLoad @JvmOverloads constructor(val config: MappingConfig, val notice: String?, val upgrade: MappingConfig? = null)
 class MappingConfig private constructor(private val values: Map<MappingInput,MappingAction>,
     private val sensitivities: Map<RotaryControl,SensitivityLevel> = RotaryControl.entries.associateWith { SensitivityLevel.Normal }) {
     fun action(input: MappingInput): MappingAction = checkNotNull(values[input])
@@ -53,7 +54,7 @@ class MappingConfig private constructor(private val values: Map<MappingInput,Map
     fun sensitivity(control: RotaryControl): SensitivityLevel = checkNotNull(sensitivities[control])
     fun withSensitivity(control: RotaryControl, level: SensitivityLevel) = MappingConfig(values,sensitivities + (control to level))
     fun encode(): String = "version=1\n" + MappingInput.entries.joinToString("\n") { "${it.id}=${action(it).id}" } +
-        "\n" + RotaryControl.entries.joinToString("\n") { "${it.id}-sensitivity=${sensitivity(it).id}" }
+        "\n" + RotaryControl.entries.joinToString("\n") { "${it.id}-sensitivity=${sensitivity(it).id}" } + "\nbookmark-controls=1"
     override fun equals(other: Any?) = other is MappingConfig && values == other.values && sensitivities == other.sensitivities
     override fun hashCode() = 31 * values.hashCode() + sensitivities.hashCode()
     companion object {
@@ -62,6 +63,8 @@ class MappingConfig private constructor(private val values: Map<MappingInput,Map
             MappingInput.ScrollUp -> MappingAction.SeekForward; MappingInput.ScrollDown -> MappingAction.SeekBackward
             MappingInput.Knob -> MappingAction.TogglePause; MappingInput.Scroll -> MappingAction.CycleSpeed
             MappingInput.Top -> MappingAction.ToggleLoop; MappingInput.C1 -> MappingAction.MarkA; MappingInput.C2 -> MappingAction.MarkB
+            MappingInput.Tall -> MappingAction.PreviousBookmark; MappingInput.Short -> MappingAction.NextBookmark
+            MappingInput.TourBoxDouble -> MappingAction.SaveBookmark
             else -> MappingAction.None
         } })
         @JvmStatic fun decode(text: String?): MappingLoad {
@@ -72,9 +75,14 @@ class MappingConfig private constructor(private val values: Map<MappingInput,Map
             if (lines.count { it == "version=1" } != 1 || lines.any { it.startsWith("version=") && it != "version=1" })
                 return MappingLoad(defaults,"配置版本不支持，已使用默认映射")
             val fields = lines.filter { '=' in it }.groupBy({ it.substringBefore('=') }, { it.substringAfter('=') })
-            var restored = false; var config = defaults
+            val marker = fields["bookmark-controls"]
+            val modern = marker == listOf("1")
+            var restored = marker != null && !modern
+            var config = if (modern) defaults else defaults.with(MappingInput.Short,MappingAction.None)
+                .with(MappingInput.Tall,MappingAction.None).with(MappingInput.TourBoxDouble,MappingAction.None)
             for (input in MappingInput.entries) {
                 val items = fields[input.id]
+                if (input == MappingInput.TourBoxDouble && items == null && !modern) continue
                 val action = items?.singleOrNull()?.let { id -> MappingAction.entries.singleOrNull { it.id == id } }
                 if (action == null) restored = true else config = config.with(input,action)
             }
@@ -83,7 +91,9 @@ class MappingConfig private constructor(private val values: Map<MappingInput,Map
                 val level = items.singleOrNull()?.let { id -> SensitivityLevel.entries.singleOrNull { it.id == id } }
                 if (level == null) restored = true else config = config.withSensitivity(control,level)
             }
-            return MappingLoad(config,if(restored) "部分设置已恢复默认，请检查后保存" else null)
+            val upgrade = if (marker == null && !restored) config.with(MappingInput.Tall,MappingAction.PreviousBookmark)
+                .with(MappingInput.Short,MappingAction.NextBookmark).with(MappingInput.TourBoxDouble,MappingAction.SaveBookmark) else null
+            return MappingLoad(config,if(restored) "部分设置/书签升级标记无效，请检查后保存" else null,upgrade)
         }
     }
 }
@@ -104,8 +114,17 @@ class MappingSaveCoordinator(private val preferences: MappingPreferencesPort) {
     private var stored: String? = null
     @Volatile private var current: MappingSnapshot
     init {
-        val loaded = try { stored = preferences.read(); MappingConfig.decode(stored) }
+        var loaded = try { stored = preferences.read(); MappingConfig.decode(stored) }
             catch (_: Exception) { MappingLoad(MappingConfig.defaults(),"设置读取失败，使用默认映射") }
+        loaded.upgrade?.let { candidate ->
+            val encoded = candidate.encode()
+            if (try { preferences.write(encoded) } catch (_: Exception) { false }) {
+                stored = encoded; loaded = MappingLoad(candidate,"已启用TourBox书签快捷键")
+            } else {
+                runCatching { preferences.write(stored) }
+                loaded = MappingLoad(loaded.config,"书签快捷键升级未保存，请选择书签动作后保存或重启重试")
+            }
+        }
         current = MappingSnapshot(loaded.config,0,loaded.notice)
     }
     fun snapshot() = current

@@ -36,11 +36,35 @@ public final class TourBoxMappingCheck {
   port.fail=true;ok(!store.save(0,changed).getSuccess());ok(store.snapshot().getConfig().equals(MappingConfig.defaults()));
   port.fail=false;ok(store.save(0,changed).getSuccess());ok(new MappingSaveCoordinator(port).snapshot().getConfig().equals(changed));
  }
+ static void bookmarkUpgradeChecks(){
+  MappingConfig modern=MappingConfig.defaults();ok(modern.action(MappingInput.TourBoxDouble)==MappingAction.SaveBookmark);
+  ok(modern.action(MappingInput.Tall)==MappingAction.PreviousBookmark&&modern.action(MappingInput.Short)==MappingAction.NextBookmark);
+  MappingConfig original=modern.with(MappingInput.Top,MappingAction.Screenshot).with(MappingInput.TourBox,MappingAction.TogglePause)
+   .with(MappingInput.Short,MappingAction.None).with(MappingInput.Tall,MappingAction.Play).with(MappingInput.TourBoxDouble,MappingAction.None)
+   .withSensitivity(RotaryControl.Knob,SensitivityLevel.Half);
+  String legacy=original.encode().lines().filter(x->!x.startsWith("bookmark-controls=")&&!x.startsWith("tourbox-double=")).collect(java.util.stream.Collectors.joining("\n"));
+  MappingLoad old=MappingConfig.decode(legacy);ok(old.getUpgrade()!=null);ok(old.getConfig().action(MappingInput.Tall)==MappingAction.Play);
+  Port p=new Port();p.value=legacy;MappingSaveCoordinator store=new MappingSaveCoordinator(p);MappingConfig migrated=store.snapshot().getConfig();
+  ok(migrated.action(MappingInput.Tall)==MappingAction.PreviousBookmark);ok(migrated.action(MappingInput.Short)==MappingAction.NextBookmark);
+  ok(migrated.action(MappingInput.TourBoxDouble)==MappingAction.SaveBookmark);ok(migrated.action(MappingInput.TourBox)==MappingAction.TogglePause);
+  ok(migrated.action(MappingInput.Top)==MappingAction.Screenshot&&migrated.sensitivity(RotaryControl.Knob)==SensitivityLevel.Half);
+  ok(p.value.contains("bookmark-controls=1"));ok(MappingConfig.decode(p.value).getUpgrade()==null);
+  MappingConfig user=migrated.with(MappingInput.Tall,MappingAction.None).with(MappingInput.Short,MappingAction.Pause).with(MappingInput.TourBoxDouble,MappingAction.None);
+  ok(store.save(0,user).getSuccess());int writes=p.writes;ok(new MappingSaveCoordinator(p).snapshot().getConfig().equals(user));ok(p.writes==writes);
+  Port fail=new Port();fail.value=legacy;fail.fail=true;MappingSnapshot kept=new MappingSaveCoordinator(fail).snapshot();
+  ok(kept.getConfig().equals(old.getConfig()));ok(kept.getNotice()!=null);ok(fail.value.equals(legacy));
+  fail.fail=false;ok(new MappingSaveCoordinator(fail).snapshot().getConfig().equals(migrated));
+  Port throwsIo=new Port();throwsIo.value=legacy;throwsIo.throwsIo=true;ok(new MappingSaveCoordinator(throwsIo).snapshot().getConfig().equals(old.getConfig()));
+  for(String marker:new String[]{"bookmark-controls=9","bookmark-controls=1\nbookmark-controls=1"}){
+   MappingLoad invalid=MappingConfig.decode(legacy+"\n"+marker);ok(invalid.getNotice()!=null);ok(invalid.getUpgrade()==null);
+  }
+  for(MappingAction a:new MappingAction[]{MappingAction.SaveBookmark,MappingAction.PreviousBookmark,MappingAction.NextBookmark})ok(a.command()==null&&!a.getRepeatable());
+ }
  public static void main(String[] args){
-  sensitivityChecks();
-  MappingConfig defaults=MappingConfig.defaults();ok(MappingInput.values().length==12);
+  sensitivityChecks();bookmarkUpgradeChecks();
+  MappingConfig defaults=MappingConfig.defaults();ok(MappingInput.values().length==13);
   MappingAction[] want={MappingAction.FrameForward,MappingAction.FrameBackward,MappingAction.SeekForward,MappingAction.SeekBackward,
-   MappingAction.TogglePause,MappingAction.CycleSpeed,MappingAction.ToggleLoop,MappingAction.MarkA,MappingAction.MarkB,MappingAction.None,MappingAction.None,MappingAction.None};
+   MappingAction.TogglePause,MappingAction.CycleSpeed,MappingAction.ToggleLoop,MappingAction.MarkA,MappingAction.MarkB,MappingAction.NextBookmark,MappingAction.PreviousBookmark,MappingAction.None,MappingAction.SaveBookmark};
   int i=0;for(MappingInput input:MappingInput.values()){ok(defaults.action(input)==want[i++]);
    for(MappingAction action:MappingAction.values()){MappingConfig c=defaults.with(input,action);ok(c.action(input)==action);ok(MappingConfig.decode(c.encode()).getConfig().equals(c));}
   }
@@ -83,7 +107,7 @@ public final class TourBoxMappingCheck {
    PlayerCommand.StepForward.INSTANCE,PlayerCommand.StepBackward.INSTANCE,new PlayerCommand.SeekRelative(5),new PlayerCommand.SeekRelative(-5),
    new PlayerCommand.ShiftSpeed(1),new PlayerCommand.ShiftSpeed(-1),PlayerCommand.CycleSpeed.INSTANCE,
    new PlayerCommand.SetSpeed(.1),new PlayerCommand.SetSpeed(.25),new PlayerCommand.SetSpeed(.5),new PlayerCommand.SetSpeed(.75),new PlayerCommand.SetSpeed(1),
-   PlayerCommand.MarkA.INSTANCE,PlayerCommand.MarkB.INSTANCE,PlayerCommand.EnableLoop.INSTANCE,PlayerCommand.ClearLoop.INSTANCE,PlayerCommand.ToggleLoop.INSTANCE,PlayerCommand.SeekA.INSTANCE,null};
+   PlayerCommand.MarkA.INSTANCE,PlayerCommand.MarkB.INSTANCE,PlayerCommand.EnableLoop.INSTANCE,PlayerCommand.ClearLoop.INSTANCE,PlayerCommand.ToggleLoop.INSTANCE,PlayerCommand.SeekA.INSTANCE,null,null,null,null};
   i=0;for(MappingAction action:MappingAction.values())ok(java.util.Objects.equals(action.command(),expectedCommands[i++]));
   MappingInput[] buttonInputs={MappingInput.Knob,MappingInput.Scroll,MappingInput.Top,MappingInput.Short,MappingInput.C1,MappingInput.C2,MappingInput.Tall,MappingInput.TourBox};
   i=0;for(TourBoxButton button:TourBoxButton.values())ok(MappingInput.fromEvent(new TourBoxInputEvent.ButtonDown(button,stamp()))==buttonInputs[i++]);

@@ -5,6 +5,12 @@ public final class ReviewPresetCheck {
  static void rejects(Runnable f){try{f.run();throw new AssertionError("expected invalid preset");}catch(IllegalArgumentException e){n++;}}
  static NativeRequest.Property prop(List<NativeRequest> r,int i){return (NativeRequest.Property)r.get(i);}
  public static void main(String[] args){
+  ok(ReviewSnapshotPlan.INSTANCE.reads(false).equals(Arrays.asList(ReviewSnapshotRead.Speed,ReviewSnapshotRead.Duration)));
+  ok(ReviewSnapshotPlan.INSTANCE.reads(true).equals(Arrays.asList(ReviewSnapshotRead.Pause,ReviewSnapshotRead.Speed,ReviewSnapshotRead.Duration)));
+  for(PlayerPhase phase:PlayerPhase.values()){
+   ok(ReviewSnapshotPlan.INSTANCE.phaseAfter(phase,false)==phase);
+   ok(ReviewSnapshotPlan.INSTANCE.phaseAfter(phase,true)==PlayerPhase.Paused);
+  }
   for(double speed:new double[]{.1,.25,.5,.75,1}){
    ReviewPreset preset=new ReviewPreset(2,4,speed);LoopPoints loop=preset.validated(10);ok(loop.getActive());ok(loop.getA()==2&&loop.getB()==4);
    List<NativeRequest> r=ReviewRestorePlan.INSTANCE.requests(preset,10);ok(r.size()==9);
